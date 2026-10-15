@@ -9,9 +9,10 @@
 # A parallel region is started by `dispatch!`:
 #
 # 1. The chunk function `f::F` is stored in a per-type `Base.RefValue{F}` slot owned by
-#    the pool. Workers receive the slot, which is already heap-allocated, so the hand-off
-#    does not allocate (no boxing of `f`).
-# 2. The caller publishes the region (number of chunks, its dynamic scope and world age),
+#    the pool. Workers receive a closure over the slot (one per type `F`, created in the
+#    caller's world age, see `job_closure`), so the hand-off does not allocate (no boxing
+#    of `f`).
+# 2. The caller publishes the region (number of chunks, its closure and dynamic scope),
 #    then gives workers chunks `2:n` by storing the chunk index into their command field
 #    (release stores, then one fence), in decreasing chunk order. The worker running on
 #    the caller's thread (if any) is skipped, because the caller occupies that thread.
@@ -173,14 +174,12 @@ SleepFlag() = SleepFlag(pad_before(), false, pad_after())
 
 mutable struct Pool
     # The current parallel region, written by the dispatcher before it hands out chunks:
-    # `Base.RefValue{F}` holding the chunk function, the number of chunks, the worker that
-    # is skipped, and the dispatcher's dynamic scope and world age
+    # the closure running the chunk function (see `job_closure`), the number of chunks,
+    # the worker that is skipped, and the dispatcher's dynamic scope
     @atomic job::Any
     @atomic nchunks::Int
     @atomic skip::Int
     @atomic scope::Any
-    # the world age as a boxed `UInt`, reused while it does not change (see `run_job_in_scope`)
-    @atomic world::Any
     const workers::Vector{WorkerState}
     const events::Vector{Base.Event}
     const tasks::Vector{Task}
@@ -322,35 +321,43 @@ else
     @inline generating_output() = ccall(:jl_generating_output, Cint, ()) != 0
 end
 
-# Called by the workers with `invoke_in_world` in the world age of the dispatcher (as for a
-# task it would have spawned), so that chunk functions whose types were defined after the
-# workers were started can be called.
+# The body of the closure the workers call (see `job_closure`).
 #
 # The dispatcher runs its chunks through this function as well, and it is not inlined: then
 # every chunk runs the same machine code. Otherwise the chunk function is inlined into
 # `dispatch!` (twice: for chunk 1 and for stolen chunks), and the dispatcher runs its own
 # copy of the loop body, whose code layout and thus speed can differ from the workers' copy
 # by a few percent (and which makes `dispatch!` larger and slower to compile).
-@noinline function run_job(slot::Base.RefValue{F}, chunk::Int) where {F}
+@noinline function run_chunk(slot::Base.RefValue{F}, chunk::Int) where {F}
     slot[](chunk)
+    return nothing
+end
+
+# Call the closure of the current region, which runs the chunk in the world age of the
+# dispatcher. A direct call of its compiled body for the usual closure type; a generic
+# call (`jl_f_opaque_closure_call`, which works from the older world of the worker too)
+# for a closure with another return type, see `new_job_closure`.
+@inline function run_job(job, chunk::Int)
+    if job isa JobClosure
+        job(chunk)
+    else
+        job(chunk)
+    end
     return nothing
 end
 
 # Run chunk `chunk` of the current region in the dispatcher's dynamic scope and world age.
 # The region is read from the pool here: passing the `Any`-typed job and scope as arguments
-# can make the call dynamic, which boxes its arguments. The world age is stored boxed and
-# passed to `Core._call_in_world` (what `invoke_in_world` calls) as is: `invoke_in_world`
-# itself takes an unboxed `UInt` and boxes it again on every call on Julia 1.10 and 1.11.
+# can make the call dynamic, which boxes its arguments.
 function run_job_in_scope(pool::Pool, chunk::Int)
-    slot = @atomic :monotonic pool.job
+    job = @atomic :monotonic pool.job
     scope = @atomic :monotonic pool.scope
-    world = @atomic :monotonic pool.world
     if scope === current_scope()
         # The common case (no `ScopedValue` or logger set by the caller): no scope to enter,
         # and no exception handler for it
-        Core._call_in_world(world, run_job, slot, chunk)
+        run_job(job, chunk)
     else
-        @enter_scope scope Core._call_in_world(world, run_job, slot, chunk)
+        @enter_scope scope run_job(job, chunk)
     end
     return nothing
 end
@@ -472,7 +479,7 @@ function Pool()
         tid2worker[tid] = k
     end
     pool = Pool(
-        nothing, 0, 0, nothing, nothing, [WorkerState() for _ in 1:nw],
+        nothing, 0, 0, nothing, [WorkerState() for _ in 1:nw],
         [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw],
         tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
         Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed()
@@ -505,9 +512,9 @@ end
 @inline pool_busy() = @atomic :monotonic POOL.busy
 
 # Set while a task runs a chunk of a region that runs on spawned tasks (`run_tasks`), and
-# inherited by tasks spawned from there. A `ScopedValue` of ScopedValues.jl (a dependency
-# of OhMyThreads), which is `Base.ScopedValues` on Julia ≥ 1.11.
-const IN_TASKS_REGION = OhMyThreads.ScopedValues.ScopedValue(false)
+# inherited by tasks spawned from there. A `ScopedValue` of ScopedValues.jl, which is
+# `Base.ScopedValues` on Julia ≥ 1.11.
+const IN_TASKS_REGION = ScopedValues.ScopedValue(false)
 
 # Is the current task running a chunk of a parallel region (as the dispatcher, as a worker,
 # or as a task of `run_tasks`)? Only consulted while the pool is busy (see `pool_busy`);
@@ -557,6 +564,61 @@ end
 # about 25 ns). Only used while holding `POOL.busy`, and cleared after every region.
 @generated function job_slot(::Type{F}) where {F}
     return :($(Base.RefValue{F}()))
+end
+
+# The closure that the workers call to run a chunk: `run_chunk(job_slot(F), chunk)` as an
+# opaque closure. An opaque closure runs its body in the world age it was created in (set
+# on entry and restored on return, so dynamic calls in the chunk function dispatch in
+# that world, as in a task the dispatcher would have spawned), and a call site that knows
+# its type calls its compiled body directly, without boxing. That is what the workers need:
+# their tasks are older than most chunk functions, and `invoke_in_world`
+# (`Core._call_in_world`) costs a generic method lookup in a world other than the current
+# one plus a boxed call on every chunk of every worker, about 20 ns on the critical path
+# of each worker (Julia 1.10 to 1.13), against 3 ns for the closure call.
+#
+# One closure per type `F`, kept in a per-type cache like `job_slot` and reused while the
+# dispatcher's world age is the one it was created in. The first loop after a method
+# definition (`include`, `eval`, Revise) creates a new one, about 120 ns when the body is
+# compiled already. Only used while holding `POOL.busy`.
+const JobClosure = Core.OpaqueClosure{Tuple{Int}, Nothing}
+
+@generated function job_closure_cache(::Type{F}) where {F}
+    return :($(Base.RefValue{Any}(nothing)))
+end
+
+@inline function job_closure(slot::Base.RefValue{F}) where {F}
+    cache = job_closure_cache(F)
+    job = cache[]
+    world = world_age()
+    if !(job isa JobClosure && job.world == world)
+        # A dynamic call (in the same world), so that the construction of the closure is
+        # not part of the code of `dispatch!`: Enzyme compiles the primal code of the
+        # loops that its rules (the EnzymeCore extension) run on the team into its own
+        # module, and its transforms crash on the closure construction (Julia 1.10).
+        job = Core._call_in_world(world, new_job_closure, slot)
+        cache[] = job
+    end
+    return job
+end
+
+# The closure is built by the runtime (`jl_new_opaque_closure`): its argument types are
+# hidden from inference, so that codegen does not build it. The runtime gives it the
+# compiled code of its body as entry point, compiling the body on the first loop with a
+# chunk function type (as the first call of a worker did before). Built by codegen, the
+# closure's body is emitted into the module of `dispatch!`, which Enzyme's transforms do
+# not handle (segmentation fault, Julia 1.10), and on Julia 1.12 and 1.13 the closure only
+# gets a stub that boxes the arguments and goes through `jl_invoke_oc` (about 13 ns and
+# 48 bytes per call). The return type can be given on Julia ≥ 1.12 only; on 1.10 and 1.11
+# it is the inferred one, `Union{}` for a chunk function that always throws (the closure is
+# then not a `JobClosure`, see `run_job`).
+@static if VERSION >= v"1.12"
+    @noinline function new_job_closure(slot::Base.RefValue{F}) where {F}
+        return Base.Experimental.@opaque Base.inferencebarrier(Tuple{Int}) -> Nothing chunk -> run_chunk(slot, chunk)
+    end
+else
+    @noinline function new_job_closure(slot::Base.RefValue{F}) where {F}
+        return Base.Experimental.@opaque Base.inferencebarrier(Tuple{Int}) chunk -> run_chunk(slot, chunk)
+    end
 end
 
 # Drop the chunk function from its slot after the region, so that it (and the arrays it
@@ -660,17 +722,14 @@ end
 function dispatch!(pool::Pool, f::F, n::Int) where {F}
     slot = job_slot(F)
     slot[] = f
+    job = job_closure(slot)
     tid = Threads.threadid()
     skip = tid <= length(pool.tid2worker) ? @inbounds(pool.tid2worker[tid]) : 0
     # Published to the workers by the (sequentially consistent) stores of the commands
-    @atomic :monotonic pool.job = slot
+    @atomic :monotonic pool.job = job
     @atomic :monotonic pool.nchunks = n
     @atomic :monotonic pool.skip = skip
     @atomic :monotonic pool.scope = current_scope()
-    world = world_age()
-    old = @atomic :monotonic pool.world
-    # box the world age only when it changed
-    (old isa UInt && old == world) || (@atomic :monotonic pool.world = world)
     try
         # Decreasing chunk order: see `wake_children`
         for chunk in n:-1:2
@@ -696,7 +755,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         # Chunk 1 is ours: wake the workers of chunks 2 and 3, they wake the others
         wake_children(pool, 1, n, skip)
         try
-            run_job(slot, 1)   # the workers' code, see `run_job`
+            run_chunk(slot, 1)   # the workers' code, see `run_chunk`
         catch
             # Cancel the chunks that were not started and wait for the others: never leave
             # workers running when returning from the region
@@ -717,7 +776,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
                 # We took over the chunk, and with it the wake-ups of its children
                 wake_children(pool, chunk, n, skip)
                 try
-                    run_job(slot, chunk)
+                    run_chunk(slot, chunk)
                 catch err
                     @inbounds pool.errs[k] = CapturedException(err, catch_backtrace())
                 end
@@ -790,7 +849,7 @@ end
     tasks = Vector{Task}(undef, n - 1)
     # Loops nested in the chunks run serially while the pool is busy (once the other task
     # has released it, the first nested loop to arrive takes the pool)
-    err1 = OhMyThreads.ScopedValues.with(IN_TASKS_REGION => true) do
+    err1 = ScopedValues.with(IN_TASKS_REGION => true) do
         for chunk in 2:n
             tasks[chunk - 1] = Threads.@spawn :default f($chunk)
         end

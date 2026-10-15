@@ -26,6 +26,7 @@ module ThreadTeams
 
 using OhMyThreads
 using OhMyThreads: Scheduler
+import ScopedValues
 
 # Re-export the OhMyThreads.jl API
 for name in names(OhMyThreads)
