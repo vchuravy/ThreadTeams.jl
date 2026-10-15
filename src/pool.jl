@@ -170,12 +170,11 @@ ChunkCounter() = ChunkCounter(pad_before(), 0, pad_after())
 # young), as libgomp's master writes `thr->fn`/`thr->data` per thread, if its field takes
 # at most `COPY_BYTES`; a larger one is run from the dispatcher's slot by every worker.
 # Reading the dispatcher's slot, rewritten in every region, costs every worker a second
-# cache miss after the one that brings the command (about 40 ns with 4 threads). A worker
-# keeps loading the lines of the `RECENT_SLOTS` slots it used last while it waits
-# (`note_slot!`), so for a loop body of one of those types the slot arrives with the
-# command, as the receiver of a Barrelfish URPC channel polls the line it expects.
+# cache miss after the one that brings the command (about 40 ns with 4 threads); its own
+# slot it reads from the dispatcher's cache in parallel with the command. (Loading the
+# lines of the slots used last while waiting, to have them arrive with the command, was
+# measured at no gain: the loads delay the claim by about as much as they save.)
 const COPY_BYTES = 256
-const RECENT_SLOTS = 4
 
 # A slot for a chunk function of type `F` (`job_slot`, `worker_slots`), padded onto cache
 # lines of its own because it is written in every region. Empty (`isdefined(slot, :x)`
@@ -202,17 +201,8 @@ mutable struct WorkerState
     @atomic cmd::Int
     @atomic job::Any
     const _pad1::PadAfter
-    # first line and line count of the slots the worker ran from last, most recent first
-    # (`note_slot!`); written and read by the worker only
-    slot_lines::NTuple{RECENT_SLOTS, Ptr{UInt64}}
-    nslot_lines::NTuple{RECENT_SLOTS, Int}
 end
-function WorkerState()
-    return WorkerState(
-        ntuple(_ -> 0, Val(PAD_BEFORE - 1)), 0, nothing, pad_after(),
-        ntuple(_ -> Ptr{UInt64}(0), Val(RECENT_SLOTS)), ntuple(_ -> 0, Val(RECENT_SLOTS))
-    )
-end
+WorkerState() = WorkerState(ntuple(_ -> 0, Val(PAD_BEFORE - 1)), 0, nothing, pad_after())
 
 # Whether a worker is asleep (or about to be), on a line of its own apart from its command:
 # written only when the worker sleeps or wakes, so the two loads per chunk in `wake_chunk`
@@ -387,8 +377,8 @@ end
 # Generic call (`jl_f_opaque_closure_call`, valid from the worker's older world) of a
 # closure that is not a `JobClosure` (`new_job_closure`); `run_job_in_scope` calls the
 # usual type directly.
-@inline function run_job(job, ws::WorkerState, k::Int, chunk::Int)
-    job(ws, k, chunk)
+@inline function run_job(job, k::Int, chunk::Int)
+    job(k, chunk)
     return nothing
 end
 
@@ -403,32 +393,16 @@ function run_job_in_scope(pool::Pool, ws::WorkerState, k::Int, cmd::Int)
     if job isa JobClosure
         if !cmd_has_scope(cmd)
             # The common case: no scope to enter, no exception handler for it
-            job(ws, k, chunk)
+            job(k, chunk)
         else
             scope = @atomic :monotonic pool.scope
-            @enter_scope scope job(ws, k, chunk)
+            @enter_scope scope job(k, chunk)
         end
     elseif !cmd_has_scope(cmd)
-        run_job(job, ws, k, chunk)
+        run_job(job, k, chunk)
     else
         scope = @atomic :monotonic pool.scope
-        @enter_scope scope run_job(job, ws, k, chunk)
-    end
-    return nothing
-end
-
-# Remember the cache lines of the field of `slot` for `wait_for_command` (`COPY_BYTES`),
-# in front of those remembered before; the oldest is forgotten. The slots live as long as
-# the process (`job_slot`), so the lines stay valid.
-@inline function note_slot!(ws::WorkerState, slot::Slot{F}) where {F}
-    p = UInt(slot_pointer(slot))
-    first = p & ~UInt(CACHE_LINE - 1)
-    nlines = cld(Int(p - first) + field_bytes(F), CACHE_LINE)
-    lines = ws.slot_lines
-    nls = ws.nslot_lines
-    if lines[1] != Ptr{UInt64}(first)
-        ws.slot_lines = ntuple(i -> i == 1 ? Ptr{UInt64}(first) : lines[i - 1], Val(RECENT_SLOTS))
-        ws.nslot_lines = ntuple(i -> i == 1 ? nlines : nls[i - 1], Val(RECENT_SLOTS))
+        @enter_scope scope run_job(job, k, chunk)
     end
     return nothing
 end
@@ -450,14 +424,7 @@ function wait_for_command(
     spins = 0
     t0 = time_ns()
     tyield = tevents = t0
-    lines = ws.slot_lines
-    nlines = ws.nslot_lines
     while true
-        # Fetch the lines of the slots used last along with the command (`COPY_BYTES`);
-        # the values are not used (atomic loads are not removed by the compiler)
-        for j in 1:RECENT_SLOTS, i in 0:(nlines[j] - 1)
-            unsafe_load(lines[j] + i * CACHE_LINE, :monotonic)
-        end
         # Relaxed: the claim below acquires the region data (published by the release store
         # of the command)
         cmd = @atomic :monotonic ws.cmd
@@ -656,7 +623,7 @@ end
     return v
 end
 
-# The closure the workers call as `job(ws, k, chunk)`: worker `k` runs the chunk from its
+# The closure the workers call as `job(k, chunk)`: worker `k` runs the chunk from its
 # own slot `worker_slot_vector(F)[k]` (`run_job_own`), or from the dispatcher's slot
 # `job_slot(F)` for a chunk function larger than `COPY_BYTES` (`run_chunk`).
 #
@@ -672,7 +639,7 @@ end
 # age is the one it was created in; the first loop after a method definition (`include`,
 # `eval`, Revise) creates a new one, about 120 ns with the body compiled. Used only while
 # holding `POOL.busy`. It holds the slots of its type, which are empty outside of regions.
-const JobClosure = Core.OpaqueClosure{Tuple{Any, Int, Int}, Nothing}
+const JobClosure = Core.OpaqueClosure{Tuple{Int, Int}, Nothing}
 
 @generated function job_closure_cache(::Type{F}) where {F}
     return :($(Base.RefValue{Any}(nothing)))
@@ -694,14 +661,11 @@ end
 
 # The body of the closure (see `job_closure`)
 @inline function run_job_closure(
-        slot::Slot{F}, wslots::Vector{Slot{F}}, ws, k::Int, chunk::Int
+        slot::Slot{F}, wslots::Vector{Slot{F}}, k::Int, chunk::Int
     ) where {F}
     if own_slots(F)
-        wslot = @inbounds wslots[k]
-        note_slot!(ws::WorkerState, wslot)
-        run_job_own(wslot, chunk)
+        run_job_own(@inbounds(wslots[k]), chunk)
     else
-        # (Not noted: every worker would keep loading the lines the dispatcher writes)
         run_chunk(slot, chunk)
     end
     return nothing
@@ -718,11 +682,11 @@ end
 # `JobClosure`, see `run_job`).
 @static if VERSION >= v"1.12"
     @noinline function new_job_closure(slot::Slot{F}, wslots::Vector{Slot{F}}) where {F}
-        return Base.Experimental.@opaque Base.inferencebarrier(Tuple{Any, Int, Int}) -> Nothing (ws, k, chunk) -> run_job_closure(slot, wslots, ws, k, chunk)
+        return Base.Experimental.@opaque Base.inferencebarrier(Tuple{Int, Int}) -> Nothing (k, chunk) -> run_job_closure(slot, wslots, k, chunk)
     end
 else
     @noinline function new_job_closure(slot::Slot{F}, wslots::Vector{Slot{F}}) where {F}
-        return Base.Experimental.@opaque Base.inferencebarrier(Tuple{Any, Int, Int}) (ws, k, chunk) -> run_job_closure(slot, wslots, ws, k, chunk)
+        return Base.Experimental.@opaque Base.inferencebarrier(Tuple{Int, Int}) (k, chunk) -> run_job_closure(slot, wslots, k, chunk)
     end
 end
 

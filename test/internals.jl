@@ -75,27 +75,6 @@ function slot_loops(n)
     return x
 end
 
-# A worker remembers the cache lines of the slots it ran from last (to fetch them with
-# its next command): aligned, covering the field of the slot, most recent first
-@testset "slot lines" begin
-    L = ThreadTeams.CACHE_LINE
-    ws = ThreadTeams.WorkerState()
-    @test all(==(0), ws.nslot_lines)
-    slots = (ThreadTeams.Slot{MutableJob}(), ThreadTeams.Slot{UnionJob}())
-    for slot in slots, _ in 1:2   # noting the same slot twice keeps it once
-        ThreadTeams.note_slot!(ws, slot)
-    end
-    for (j, slot) in enumerate(reverse(slots))
-        F = typeof(slot).parameters[1]
-        p = UInt(ThreadTeams.slot_pointer(slot))
-        first = UInt(ws.slot_lines[j])
-        @test first % L == 0
-        @test first <= p
-        @test p + ThreadTeams.field_bytes(F) <= first + ws.nslot_lines[j] * L
-    end
-    @test all(==(0), ws.nslot_lines[3:end])
-end
-
 @testset "own slots" begin
     @test !ThreadTeams.own_slots(BigJob)
     @test ThreadTeams.own_slots(MutableJob) && ThreadTeams.own_slots(UnionJob)

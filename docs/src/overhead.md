@@ -90,11 +90,10 @@ Five details keep the hand-off at that level:
   wake-up check hit a line shared between all cores, not the line the worker claims its
   chunk on. Before this, the wake-up checks cost the calling thread 70 ns and every worker
   50–120 ns per loop.
-- The dispatcher stores the chunk function into a slot of each worker, and a waiting
-  worker keeps loading the lines of the slots it used last, so the loop body arrives with
-  the command. Reading it from the dispatcher's slot, rewritten every loop, cost every
-  worker a second cache miss after the one that brings the command (30–40 ns per loop with
-  4 threads). Chunk functions above 256 bytes still run from the dispatcher's slot.
+- The dispatcher stores the chunk function into a slot of each worker. Reading it from the
+  dispatcher's slot, rewritten every loop, cost every worker a second cache miss after the
+  one that brings the command (30–40 ns per loop with 4 threads). Chunk functions above
+  256 bytes still run from the dispatcher's slot.
 - The slot that hands the chunk function to the workers and the buffer for the partial
   results are constants embedded by `@generated` functions, one per type, not `IdDict`
   entries: the two lookups cost about 50 ns per loop.
