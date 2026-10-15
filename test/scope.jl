@@ -52,7 +52,7 @@
     wslot[] = f
     job(1, 5)   # the older closure still runs in its world
     @test r[5] == 1
-    @test !isdefined(wslot, :x)
+    @test !isassigned(wslot)
     ThreadTeams.clear_slot!(slot)
 end
 

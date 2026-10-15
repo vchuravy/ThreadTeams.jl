@@ -8,7 +8,8 @@
 #
 # A parallel region is started by `dispatch!`:
 #
-# 1. The chunk function `f::F` is stored into pre-allocated per-type `Slot{F}`s: the
+# 1. The chunk function `f::F` is stored into pre-allocated per-type `Slot{F}`s (one
+#    element of a `Memory{F}` each, emptied after the region with `unsetindex!`): the
 #    caller's, and one per worker unless `f` is large (`COPY_BYTES`). No boxing of `f`.
 #    Workers run it through a closure per type `F`, created in the caller's world age
 #    (`job_closure`), which finds the worker's slot from the worker's index.
@@ -166,9 +167,9 @@ end
 ChunkCounter() = ChunkCounter(pad_before(), 0, pad_after())
 
 # The dispatcher stores the chunk function into a slot of each worker (`worker_slots`)
-# with `setfield!` (so with the GC's write barrier: the slots are old, the captures may be
-# young), as libgomp's master writes `thr->fn`/`thr->data` per thread, if its field takes
-# at most `COPY_BYTES`; a larger one is run from the dispatcher's slot by every worker.
+# with a typed store (so with the GC's write barrier: the slots are old, the captures may
+# be young), as libgomp's master writes `thr->fn`/`thr->data` per thread, if it takes at
+# most `COPY_BYTES`; a larger one is run from the dispatcher's slot by every worker.
 # Reading the dispatcher's slot, rewritten in every region, costs every worker a second
 # cache miss after the one that brings the command (about 40 ns with 4 threads); its own
 # slot it reads from the dispatcher's cache in parallel with the command. (Loading the
@@ -176,23 +177,52 @@ ChunkCounter() = ChunkCounter(pad_before(), 0, pad_after())
 # measured at no gain: the loads delay the claim by about as much as they save.)
 const COPY_BYTES = 256
 
-# A slot for a chunk function of type `F` (`job_slot`, `worker_slots`), padded onto cache
-# lines of its own because it is written in every region. Empty (`isdefined(slot, :x)`
-# false) outside of regions, see `clear_slot!`.
-mutable struct Slot{F}
-    const _pad0::PadAfter
-    x::F
-    const _pad1::PadAfter
-    Slot{F}() where {F} = new{F}()
+# A slot for a chunk function of type `F` (`job_slot`, `worker_slots`): one element of a
+# `Memory{F}` (a `Vector{F}` on Julia 1.10) with a cache line of unused elements on each
+# side, since it is written in every region. Stored with a typed `setindex!` (so with the
+# GC's write barrier) and emptied with `unsetindex!` (`clear_slot!`), after which
+# `isassigned(slot)` is false. On Julia ≥ 1.11 the slot holds a `MemoryRef` to the
+# element, one load away; on 1.10 the vector and the index.
+@static if isdefined(Core, :Memory)
+    struct Slot{F}
+        ref::MemoryRef{F}
+    end
+    function Slot{F}() where {F}
+        pad = slot_padding(F)
+        return Slot{F}(Core.memoryref(Memory{F}(undef, 2 * pad + 1), pad + 1))
+    end
+    @inline Base.getindex(slot::Slot) = slot.ref[]
+    @inline Base.setindex!(slot::Slot{F}, f) where {F} =
+        (Core.memoryrefset!(slot.ref, f, :not_atomic, false); slot)
+    Base.isassigned(slot::Slot) = Core.memoryref_isassigned(slot.ref, :not_atomic, false)
+    @inline unset_slot!(slot::Slot) = unsetindex!(slot.ref)
+    slot_memory(slot::Slot) = slot.ref.mem
+    slot_index(slot::Slot) = Base.memoryrefoffset(slot.ref)
+else
+    struct Slot{F}
+        mem::Vector{F}
+        i::Int
+    end
+    function Slot{F}() where {F}
+        pad = slot_padding(F)
+        return Slot{F}(Vector{F}(undef, 2 * pad + 1), pad + 1)
+    end
+    @inline Base.getindex(slot::Slot) = @inbounds slot.mem[slot.i]
+    @inline Base.setindex!(slot::Slot{F}, f) where {F} = (@inbounds slot.mem[slot.i] = f; slot)
+    Base.isassigned(slot::Slot) = isassigned(slot.mem, slot.i)
+    @inline unset_slot!(slot::Slot) = unsetindex!(slot.mem, slot.i)
+    slot_memory(slot::Slot) = slot.mem
+    slot_index(slot::Slot) = slot.i
 end
-Base.getindex(slot::Slot) = slot.x
-Base.setindex!(slot::Slot{F}, f) where {F} = (slot.x = f; slot)
-# Bytes of a field of type `F`: the value if stored inline, else a reference
+# Elements of type `F` per cache line, plus one
+slot_padding(::Type{F}) where {F} = cld(CACHE_LINE, max(Base.aligned_sizeof(F), 1)) + 1
+# `Base.unsetindex!` is public since Julia 1.14; before, the internal `_unsetindex!` is
+# the same function
+const unsetindex! = isdefined(Base, :unsetindex!) ? Base.unsetindex! : Base._unsetindex!
+# Bytes of an element of type `F`: the value if stored inline, else a reference
 @inline field_bytes(::Type{F}) where {F} = sizeof(Base.RefValue{F})
 # Whether chunk functions of type `F` go into the workers' own slots (`COPY_BYTES`)
 @inline own_slots(::Type{F}) where {F} = field_bytes(F) <= COPY_BYTES
-@inline slot_pointer(slot::Slot{F}) where {F} =
-    pointer_from_objref(slot) + fieldoffset(Slot{F}, 2)
 # A worker's command and the closure of the region (`job_closure`), a 16-byte pair at a
 # multiple of 16 bytes on a cache line of their own: one line transfer brings the worker
 # both, and the rest of the region data inside the command (`cmd_base`).
@@ -370,7 +400,7 @@ end
 # inlined into `dispatch!` and the closure, the dispatcher's copy of the loop body can
 # differ in layout and speed by a few percent, and `dispatch!` compiles slower.
 @noinline function run_chunk(slot::Slot{F}, chunk::Int) where {F}
-    slot.x(chunk)
+    slot[](chunk)
     return nothing
 end
 
@@ -597,17 +627,31 @@ end
 end
 
 # The dispatcher's slot for chunk functions of type `F`: pre-allocated, so storing one
-# does not box it. Created when the generated function is first specialized for `F` and
-# embedded in its body as a constant, so that getting it costs nothing (an `IdDict`
-# lookup costs about 25 ns). Used only while holding `POOL.busy`, cleared after every
-# region.
-@generated function job_slot(::Type{F}) where {F}
-    return :($(Slot{F}()))
+# does not box it. Its cache is created when the generated function is first specialized
+# for `F` and embedded in its body as a constant, so that getting it costs nothing (an
+# `IdDict` lookup costs about 25 ns); the slot itself is created at the first region of a
+# session, since a `MemoryRef` embedded in a package image comes out broken (Julia 1.12:
+# `unsetindex!` on it segfaults). Loops run serially during precompilation, so no image
+# holds a slot. Used only while holding `POOL.busy`, cleared after every region.
+@generated function job_slot_cache(::Type{F}) where {F}
+    return :($(Base.RefValue{Union{Nothing, Slot{F}}}(nothing)))
+end
+@inline function job_slot(::Type{F}) where {F}
+    cache = job_slot_cache(F)
+    slot = cache[]
+    slot === nothing && (slot = new_job_slot(F, cache))
+    return slot
+end
+@noinline function new_job_slot(::Type{F}, cache::Base.RefValue) where {F}
+    slot = Slot{F}()
+    cache[] = slot
+    return slot
 end
 
 # The workers' slots for chunk functions of type `F` (`COPY_BYTES`): slot `k` is used by
-# worker `k` only, so it stays in that worker's cache. Created once per type like
-# `job_slot`, grown when a region first needs them.
+# worker `k` only, so it stays in that worker's cache. The vector is created once per type
+# like `job_slot`'s cache, and grown when a region first needs the slots (so an image
+# holds it empty).
 @generated function worker_slot_vector(::Type{F}) where {F}
     return :($(Slot{F}[]))
 end
@@ -691,21 +735,11 @@ else
 end
 
 # Drop the chunk function from its slot after the region, so that it and its captures can
-# be collected. `setfield!` can not make a field undefined and storing a struct with null
-# references would trip the write barrier, so the field's bytes are zeroed: the state
-# `Slot{F}()` creates, since Julia marks an undefined inline struct by a null first
-# pointer. Afterwards `isdefined(slot, :x)` is false (for an isbits `F` the zeros are a
-# value, for a mutable `F` a null reference). The GC skips null fields, and removing
-# references needs no barrier. Rounding up to words stays within the padding.
+# be collected: `unsetindex!` nulls the element's references (removing references needs
+# no write barrier); afterwards `isassigned(slot)` is false. Nothing reads a slot outside
+# a region.
 @inline function clear_slot!(slot::Slot{F}) where {F}
-    GC.@preserve slot zero_words!(slot_pointer(slot), field_bytes(F))
-    return nothing
-end
-@inline function zero_words!(dst::Ptr, nbytes::Int)
-    d = Ptr{UInt64}(dst)
-    for i in 1:cld(nbytes, 8)
-        unsafe_store!(d, UInt64(0), i)
-    end
+    unset_slot!(slot)
     return nothing
 end
 

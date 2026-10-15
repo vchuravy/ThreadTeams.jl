@@ -16,7 +16,7 @@ end
     @test L == (Sys.ARCH === :aarch64 ? 128 : 64)
     for (T, field) in [
             (ThreadTeams.ChunkCounter, :next), (ThreadTeams.WorkerState, :cmd),
-            (ThreadTeams.SleepFlag, :sleeping), (ThreadTeams.Slot{Int}, :x),
+            (ThreadTeams.SleepFlag, :sleeping),
         ]
         off = Int(fieldoffset(T, findfirst(==(field), fieldnames(T))))
         for base in 0:16:(L - 16)   # every alignment of the object within a line
@@ -75,6 +75,20 @@ function slot_loops(n)
     return x
 end
 
+# A slot's element has at least a cache line of unused elements on each side, and is empty
+# when created
+@testset "slot padding" begin
+    for F in (Int, MutableJob, UnionJob, BigJob)
+        slot = ThreadTeams.Slot{F}()
+        mem = ThreadTeams.slot_memory(slot)
+        i = ThreadTeams.slot_index(slot)
+        sz = max(Base.aligned_sizeof(F), 1)
+        @test (i - 1) * sz >= ThreadTeams.CACHE_LINE
+        @test (length(mem) - i) * sz >= ThreadTeams.CACHE_LINE
+        isbitstype(F) || @test !isassigned(slot)   # an isbits element is always assigned
+    end
+end
+
 @testset "own slots" begin
     @test !ThreadTeams.own_slots(BigJob)
     @test ThreadTeams.own_slots(MutableJob) && ThreadTeams.own_slots(UnionJob)
@@ -84,10 +98,10 @@ end
     if NW > 1
         # a small chunk function has a slot per worker, a large one none
         for (F, nslots) in ((BigJob, 0), (MutableJob, NW), (UnionJob, NW))
-            @test !isdefined(ThreadTeams.job_slot(F), :x)
+            @test !isassigned(ThreadTeams.job_slot(F))
             slots = ThreadTeams.worker_slot_vector(F)
             @test length(slots) == nslots
-            @test !any(slot -> isdefined(slot, :x), slots)
+            @test !any(isassigned, slots)
         end
     end
 end
@@ -103,12 +117,12 @@ end
     if NW > 1
         x = zeros(NW)
         @test_throws ArgumentError ThreadTeams.run_chunks(ThrowingJob(x), NW, team)
-        @test !isdefined(ThreadTeams.job_slot(ThrowingJob), :x)
-        @test !any(slot -> isdefined(slot, :x), ThreadTeams.worker_slot_vector(ThrowingJob))
+        @test !isassigned(ThreadTeams.job_slot(ThrowingJob))
+        @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
         # The next loop with the same chunk function type works
         y = zeros(NW + 1)
         ThreadTeams.run_chunks(ThrowingJob(y), NW, team)
         @test all(==(1.0), y[1:NW])
-        @test !any(slot -> isdefined(slot, :x), ThreadTeams.worker_slot_vector(ThrowingJob))
+        @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
     end
 end
