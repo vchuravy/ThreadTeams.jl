@@ -512,9 +512,9 @@ end
 @inline pool_busy() = @atomic :monotonic POOL.busy
 
 # Set while a task runs a chunk of a region that runs on spawned tasks (`run_tasks`), and
-# inherited by tasks spawned from there. A `ScopedValue` of ScopedValues.jl (a dependency
-# of OhMyThreads), which is `Base.ScopedValues` on Julia ≥ 1.11.
-const IN_TASKS_REGION = OhMyThreads.ScopedValues.ScopedValue(false)
+# inherited by tasks spawned from there. A `ScopedValue` of ScopedValues.jl, which is
+# `Base.ScopedValues` on Julia ≥ 1.11.
+const IN_TASKS_REGION = ScopedValues.ScopedValue(false)
 
 # Is the current task running a chunk of a parallel region (as the dispatcher, as a worker,
 # or as a task of `run_tasks`)? Only consulted while the pool is busy (see `pool_busy`);
@@ -849,7 +849,7 @@ end
     tasks = Vector{Task}(undef, n - 1)
     # Loops nested in the chunks run serially while the pool is busy (once the other task
     # has released it, the first nested loop to arrive takes the pool)
-    err1 = OhMyThreads.ScopedValues.with(IN_TASKS_REGION => true) do
+    err1 = ScopedValues.with(IN_TASKS_REGION => true) do
         for chunk in 2:n
             tasks[chunk - 1] = Threads.@spawn :default f($chunk)
         end
