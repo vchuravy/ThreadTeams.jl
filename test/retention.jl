@@ -33,15 +33,23 @@ function failing_loop_over_temporary()
     return w
 end
 
+# `GC.gc()` does nothing when another thread is collecting at that moment: it only waits for
+# that collection, which can be an incremental one that keeps old objects. Tasks of the test
+# runner allocate on other threads, so collect until the objects are gone (or give up).
+function collected(ws::WeakRef...)
+    for _ in 1:10
+        GC.gc()
+        all(w -> w.value === nothing, ws) && return true
+    end
+    return false
+end
+
 @testset "no references after a loop" begin
     w, s, wv = loop_over_temporary()
     @test s == 10^6
-    GC.gc(); GC.gc()
-    @test w.value === nothing
-    @test wv.value === nothing
+    @test collected(w, wv)
     w = failing_loop_over_temporary()
-    GC.gc(); GC.gc()
-    @test w.value === nothing
+    @test collected(w)
     if NW > 1
         pool = @atomic ThreadTeams.POOL.pool
         @test all(isnothing, pool.errs)

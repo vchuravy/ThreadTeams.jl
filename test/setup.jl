@@ -1,6 +1,7 @@
 # Shared definitions, evaluated in the sandbox module of every test file
 using ThreadTeams: nworkers
 using OhMyThreads: OhMyThreads, WithTaskIndex
+using ScopedValues: ScopedValues
 
 const NW = nworkers()
 const PS = TeamScheduler
