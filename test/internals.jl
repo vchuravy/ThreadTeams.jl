@@ -93,10 +93,11 @@ end
         @test all(==(3.5), payload_loops(NW))   # 1 + 1 + 2.5 - 1
     end
     if NW > 1
-        for F in (BigJob, MutableJob, UnionJob)
+        # a chunk function handed as bytes has a slot per worker, a larger one none
+        for (F, nslots) in ((BigJob, 0), (MutableJob, NW), (UnionJob, NW))
             @test !isdefined(ThreadTeams.job_slot(F), :x)
             slots = ThreadTeams.worker_slot_vector(F)
-            @test length(slots) == NW
+            @test length(slots) == nslots
             @test !any(slot -> isdefined(slot, :x), slots)
         end
     end

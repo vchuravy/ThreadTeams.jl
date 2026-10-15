@@ -59,7 +59,7 @@ end
         # the partials buffers of the reductions above are empty again
         @test isempty(ThreadTeams.static_buffer(Float64))
         @test isempty(ThreadTeams.static_buffer(Vector{Float64}))
-        # and a cleared slot is undefined again, as a fresh `RefValue{F}()` is
+        # and a cleared slot is undefined again, as a fresh `Slot{F}()` is
         f = let v = zeros(1)
             i -> v[i]
         end

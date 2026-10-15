@@ -89,16 +89,19 @@ struct MapReduceItems{F, Op, I, K}
     kwargs::K
 end
 function (j::MapReduceItems)(c::Int)
-    if j.n == length(j.items) && j.kwargs isa NamedTuple{(:init,)}
-        # One item per chunk (as for `chunks(...; n = nthreads())` inputs), with `init`
-        # (as for `tforeach`): `mapreduce` over the item is `op(init, f(item))`. Written
-        # out, this keeps the index arithmetic and `mapreduce` off the critical path of
-        # every chunk.
-        i = firstindex(j.items) + (c - 1)
-        x = promise_task_local(j.f, i)(j.items[i])
-        return promise_task_local(j.op)(j.kwargs.init, x)
-    end
     r = chunk_range(j.items, c, j.n)
+    if j.kwargs isa NamedTuple{(:init,)}
+        # With `init` (as for `tforeach`), `mapreduce` is the left fold
+        # `op(op(init, f(item1)), f(item2))...` (`Base.mapfoldl_impl`). Written out, this
+        # keeps `mapreduce` off the critical path of every chunk; for one item per chunk
+        # (as for `chunks(...; n = nthreads())` inputs) it is `op(init, f(item))`.
+        op = promise_task_local(j.op)
+        acc = j.kwargs.init
+        for i in r
+            acc = op(acc, promise_task_local(j.f, i)(j.items[i]))
+        end
+        return acc
+    end
     return mapreduce(
         i -> promise_task_local(j.f, i)(j.items[i]),
         promise_task_local(j.op), r; j.kwargs...

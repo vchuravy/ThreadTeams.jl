@@ -417,16 +417,12 @@ end
     return nothing
 end
 
-# Call the closure of the current region, which runs the chunk in the world age of the
-# dispatcher. A direct call of its compiled body for the usual closure type; a generic
-# call (`jl_f_opaque_closure_call`, which works from the older world of the worker too)
-# for a closure with another return type, see `new_job_closure`.
+# Call a closure of the current region that is not a `JobClosure` (another return type,
+# see `new_job_closure`): a generic call (`jl_f_opaque_closure_call`, which works from the
+# older world of the worker too). The usual closure type is called directly by
+# `run_job_in_scope`.
 @inline function run_job(job, ws::Union{WorkerState, Nothing}, k::Int, chunk::Int)
-    if job isa JobClosure
-        job(ws, k, chunk)
-    else
-        job(ws, k, chunk)
-    end
+    job(ws, k, chunk)
     return nothing
 end
 
@@ -909,7 +905,9 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
     # Hand the chunk function to the workers as bytes if it fits (see `PAYLOAD_BYTES`)
     nbytes = field_bytes(F)
     payload = cld(nbytes, 8) * 8 <= PAYLOAD_BYTES
-    wslots = worker_slots(F, length(pool.workers))
+    # The workers' slots are only used (and only need to exist) for a chunk function that
+    # is handed as bytes
+    wslots = payload ? worker_slots(F, length(pool.workers)) : worker_slot_vector(F)
     base = cmd_base(n, skip, has_scope, payload)
     try
         # Decreasing chunk order: see `wake_children`
@@ -969,8 +967,12 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         for chunk in 2:n
             k = worker_for_chunk(chunk, skip)
             # A worker whose chunk threw left its copy of the chunk function in its slot
-            # (see `run_job_copy`)
-            if (@inbounds pool.errs[k]) !== nothing
+            # (see `run_job_copy`), and so may have a worker that died with its command
+            # still set (see `dead_worker_error`; every live worker is idle here). The copy
+            # was stored without a write barrier, so it must not outlive the dispatcher's
+            # slot, which was cleared above: clear it before anything can run the GC.
+            if (@inbounds pool.errs[k]) !== nothing ||
+                    (@atomic :monotonic (@inbounds pool.workers[k]).cmd) != 0
                 payload && clear_slot!(@inbounds wslots[k])
                 @inbounds pool.errs[k] = nothing
             end
