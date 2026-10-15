@@ -26,7 +26,9 @@ function run_fresh(code; env = Dict{String, String}())
 end
 
 # The chunk function types that the cache was specialized for, and how many of the
-# caches hold a closure: a report at the end of the fresh process' code
+# caches hold a closure: a report at the end of the fresh process' code. (A
+# specialization on `::Type{F}` is keyed `Type{F}`, on Julia ≥ 1.14 `Core.TypeEgal{F}`, a
+# kind of type of its own.)
 const REPORT = """
 function cached_types()
     Fs = Any[]
@@ -34,7 +36,9 @@ function cached_types()
         st = mi.specTypes
         st isa DataType || continue
         T = st.parameters[2]
-        (T isa DataType && T <: Type && isconcretetype(T.parameters[1])) || continue
+        ((T isa DataType && T <: Type) || (isdefined(Core, :TypeEgal) && T isa Core.TypeEgal)) ||
+            continue
+        isconcretetype(T.parameters[1]) || continue
         push!(Fs, T.parameters[1])
     end
     return Fs
