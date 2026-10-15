@@ -78,7 +78,7 @@ A worker claims its chunk within about 20 ns of the stores and is done about 100
 later, of which the chunk itself is about 60 ns. The rest of its time is the wake-up check
 for its two children in the binary tree and the call of the chunk closure (see `job_closure` in `src/pool.jl`).
 
-Four details keep the hand-off at that level:
+Five details keep the hand-off at that level:
 
 - The command stores are release stores followed by one fence rather than sequentially
   consistent stores: an `xchg` per store would wait for each cache line in turn, where
@@ -91,6 +91,12 @@ Four details keep the hand-off at that level:
   every wake-up check hit a line that stays shared between all cores, instead of the line
   the worker is claiming its chunk on. Before this, the wake-up checks cost the calling
   thread 70 ns and every worker 50–120 ns per loop.
+- The chunk function reaches a worker as a copy of its bytes, in a buffer next to the
+  worker's command whose lines the worker keeps loading while it waits, and the worker
+  copies it into a slot of its own. Reading it from the dispatcher's slot, which the
+  dispatcher writes in every loop, cost every worker a second cache miss after the one that
+  brings it the command (about 30–40 ns per loop with 4 threads). Large chunk functions
+  (above 256 bytes) still go through the dispatcher's slot.
 - The slot that hands the chunk function to the workers and the buffer for the partial
   results are constants embedded by `@generated` functions, one per type, instead of
   entries of an `IdDict`: the two lookups cost about 50 ns per loop.

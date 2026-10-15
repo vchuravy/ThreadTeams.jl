@@ -52,7 +52,7 @@ How a parallel operation runs on the team, and what that means for the code insi
 - **Waking up.** Sleeping workers are woken in a binary tree: whoever takes chunk `c` wakes
   the workers of chunks `2c` and `2c + 1`. The caller wakes at most two workers itself, so
   waking all workers takes O(log n) steps on its critical path instead of n.
-- **Allocates once.** The first run of a parallel loop allocates once (the slot that hands
+- **Allocates once.** The first run of a parallel loop allocates once (the slots that hand
   the loop body to the workers, and the buffer for the partial results of a reduction).
   Later runs of the same loop allocate nothing. After a loop, the team holds no reference to
   the loop body, the arrays it captured, the partial results or the exceptions of the

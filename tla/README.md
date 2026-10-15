@@ -34,8 +34,9 @@ Sequentially consistent *accesses* lie between two encodings (constant `SCENC`):
 A property that holds under `weak` holds under C11 on any hardware; one that fails under
 `fence` fails on x86. The explicit `Threads.atomic_fence()` is an sc fence in both.
 
-**Abstractions.** The region data (`pool.job`, `nchunks`, `skip`, `scope`, `world`) is one
-location written before the commands; a worker's results (`errs[k]`, the partials buffer)
+**Abstractions.** The region data (the closure `ws.job`, the bytes of the chunk function,
+the scope; the number of chunks and the skipped worker travel in the command word itself)
+is one location written before the commands; a worker's results (`errs[k]`, the partials buffer)
 are one location written before its final `cmd = 0`. The worker's `Event` is a flag that
 carries the notifier's view (its lock is a release/acquire pair). Loops that re-read a
 location get a fairness assumption: a store becomes visible eventually.
@@ -97,7 +98,7 @@ these accesses sequentially consistent, which costs nothing on x86 (every load i
 
 | access | ordering | why |
 |---|---|---|
-| `pool.job`, `nchunks`, `skip`, `scope`, `world` stores and loads | monotonic | published by the release store of the command, acquired by the worker's claim |
+| `ws.job`, payload buffer, `pool.scope` stores and loads | monotonic | published by the release store of the command, acquired by the worker's claim |
 | `ws.cmd = chunk` (`dispatch!`) | release | publishes the region data; seven relaxed-ordered release stores overlap in the store buffer, where sc stores would each wait |
 | `Threads.atomic_fence()` after them | sc | the dispatcher's side of the sleep handshake |
 | `sleeping`, `cmd` loads in `wake_chunk` | sc | the waker's side of the handshake (see above) |
