@@ -98,7 +98,7 @@ these accesses sequentially consistent, which costs nothing on x86 (every load i
 
 | access | ordering | why |
 |---|---|---|
-| `ws.job`, payload buffer, `pool.scope` stores and loads | monotonic | published by the release store of the command, acquired by the worker's claim |
+| `ws.job`, the workers' slots, `pool.scope` stores and loads | monotonic | published by the release store of the command, acquired by the worker's claim |
 | `ws.cmd = chunk` (`dispatch!`) | release | publishes the region data; seven relaxed-ordered release stores overlap in the store buffer, where sc stores would each wait |
 | `Threads.atomic_fence()` after them | sc | the dispatcher's side of the sleep handshake |
 | `sleeping`, `cmd` loads in `wake_chunk` | sc | the waker's side of the handshake (see above) |

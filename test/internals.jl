@@ -34,7 +34,7 @@ end
 
 @testset "command encoding" begin
     for (n, skip, scope) in [(2, 0, false), (64, 3, true), (ThreadTeams.CMD_MASK, 17, true)]
-        base = ThreadTeams.cmd_base(n, skip, scope, !scope)
+        base = ThreadTeams.cmd_base(n, skip, scope)
         for chunk in (2, n)
             cmd = base | chunk
             @test cmd > 0
@@ -42,28 +42,16 @@ end
             @test ThreadTeams.cmd_nchunks(cmd) == n
             @test ThreadTeams.cmd_skip(cmd) == skip
             @test ThreadTeams.cmd_has_scope(cmd) == scope
-            @test ThreadTeams.cmd_has_payload(cmd) == !scope
         end
     end
 end
 
-# The payload buffer of a worker is a whole number of cache lines of its own
-@testset "payload buffer" begin
-    L = ThreadTeams.CACHE_LINE
-    ws = ThreadTeams.WorkerState()
-    p = UInt(ws.payload_ptr)
-    start = UInt(pointer_from_objref(ws.payload))
-    @test p % L == 0
-    @test start <= p
-    @test p + ThreadTeams.PAYLOAD_BYTES <= start + sizeof(ThreadTeams.PayloadBuffer)
-end
-
-# Chunk functions are handed to the workers as bytes if they fit into the payload buffer,
+# Chunk functions are stored into the workers' own slots if they are small (`COPY_BYTES`),
 # else as the dispatcher's slot. Both work, also for the kinds of fields a closure can have,
 # and leave no reference behind in the slots of the workers.
 struct BigJob
     x::Vector{Float64}
-    pad::NTuple{40, Float64}   # does not fit into the payload buffer
+    pad::NTuple{40, Float64}   # larger than `COPY_BYTES`
 end
 (j::BigJob)(i) = (j.x[i] += j.pad[1]; nothing)
 mutable struct MutableJob
@@ -78,7 +66,7 @@ end
 (j::UnionJob)(i) = (j.x[i] += something(j.a, 0.0) + j.b; nothing)
 
 # `run_chunks` calls the chunk function with the chunk index
-function payload_loops(n)
+function slot_loops(n)
     x = zeros(n)
     ThreadTeams.run_chunks(BigJob(x, ntuple(_ -> 1.0, 40)), n, team)
     ThreadTeams.run_chunks(MutableJob(x), n, team)
@@ -87,13 +75,35 @@ function payload_loops(n)
     return x
 end
 
-@testset "payload hand-off" begin
-    @test sizeof(BigJob) > ThreadTeams.PAYLOAD_BYTES
+# A worker remembers the cache lines of the slots it ran from last (to fetch them with
+# its next command): aligned, covering the field of the slot, most recent first
+@testset "slot lines" begin
+    L = ThreadTeams.CACHE_LINE
+    ws = ThreadTeams.WorkerState()
+    @test all(==(0), ws.nslot_lines)
+    slots = (ThreadTeams.Slot{MutableJob}(), ThreadTeams.Slot{UnionJob}())
+    for slot in slots, _ in 1:2   # noting the same slot twice keeps it once
+        ThreadTeams.note_slot!(ws, slot)
+    end
+    for (j, slot) in enumerate(reverse(slots))
+        F = typeof(slot).parameters[1]
+        p = UInt(ThreadTeams.slot_pointer(slot))
+        first = UInt(ws.slot_lines[j])
+        @test first % L == 0
+        @test first <= p
+        @test p + ThreadTeams.field_bytes(F) <= first + ws.nslot_lines[j] * L
+    end
+    @test all(==(0), ws.nslot_lines[3:end])
+end
+
+@testset "own slots" begin
+    @test !ThreadTeams.own_slots(BigJob)
+    @test ThreadTeams.own_slots(MutableJob) && ThreadTeams.own_slots(UnionJob)
     for _ in 1:100
-        @test all(==(3.5), payload_loops(NW))   # 1 + 1 + 2.5 - 1
+        @test all(==(3.5), slot_loops(NW))   # 1 + 1 + 2.5 - 1
     end
     if NW > 1
-        # a chunk function handed as bytes has a slot per worker, a larger one none
+        # a small chunk function has a slot per worker, a large one none
         for (F, nslots) in ((BigJob, 0), (MutableJob, NW), (UnionJob, NW))
             @test !isdefined(ThreadTeams.job_slot(F), :x)
             slots = ThreadTeams.worker_slot_vector(F)
@@ -103,14 +113,14 @@ end
     end
 end
 
-# A chunk that throws on a worker leaves its copy of the chunk function in the worker's
-# slot; the dispatcher drops it at the end of the region
+# A chunk that throws on a worker leaves the chunk function in the worker's slot; the
+# dispatcher drops it at the end of the region
 struct ThrowingJob
     x::Vector{Float64}
 end
 (j::ThrowingJob)(i) = i == length(j.x) ? throw(ArgumentError("chunk $i")) : (j.x[i] = 1.0; nothing)
 
-@testset "payload hand-off: exceptions" begin
+@testset "own slots: exceptions" begin
     if NW > 1
         x = zeros(NW)
         @test_throws ArgumentError ThreadTeams.run_chunks(ThrowingJob(x), NW, team)

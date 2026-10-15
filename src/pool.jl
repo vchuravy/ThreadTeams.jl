@@ -8,13 +8,12 @@
 #
 # A parallel region is started by `dispatch!`:
 #
-# 1. The chunk function `f::F` is stored in a per-type `Slot{F}` owned by the pool, which
-#    is already heap-allocated, so the hand-off does not allocate (no boxing of `f`).
-#    Workers receive a copy of its bytes in a buffer next to their command, which they
-#    copy into a slot of their own (or the slot itself, if `f` is large; see
-#    `PAYLOAD_BYTES`). They run it through a closure (one per type `F`, created in the
-#    caller's world age, see `job_closure`) that is called with the worker's index and
-#    buffer, and so finds the worker's own slot.
+# 1. The chunk function `f::F` is stored in per-type `Slot{F}`s owned by the pool, which
+#    are already heap-allocated, so the hand-off does not allocate (no boxing of `f`): the
+#    caller's own slot, and one per worker (or only the caller's, if `f` is large; see
+#    `COPY_BYTES`). Workers run it through a closure (one per type `F`, created in the
+#    caller's world age, see `job_closure`) that is called with the worker's index, and so
+#    finds the worker's own slot.
 # 2. The caller publishes the region (its dynamic scope, if it has one), then gives
 #    workers chunks `2:n` by storing the closure and the command (the chunk index and the
 #    number of chunks) into their `WorkerState` (release stores, then one fence),
@@ -67,15 +66,12 @@ const RUNNING = -2
 const CMD_BITS = Sys.WORD_SIZE == 64 ? 20 : 9
 const CMD_MASK = (1 << CMD_BITS) - 1
 const SCOPE_BIT = 1 << (Sys.WORD_SIZE - 2)
-const PAYLOAD_BIT = 1 << (Sys.WORD_SIZE - 3)
-@inline cmd_base(n::Int, skip::Int, has_scope::Bool, payload::Bool) =
-    (n << CMD_BITS) | (skip << (2 * CMD_BITS)) | (has_scope ? SCOPE_BIT : 0) |
-    (payload ? PAYLOAD_BIT : 0)
+@inline cmd_base(n::Int, skip::Int, has_scope::Bool) =
+    (n << CMD_BITS) | (skip << (2 * CMD_BITS)) | (has_scope ? SCOPE_BIT : 0)
 @inline cmd_chunk(cmd::Int) = cmd & CMD_MASK
 @inline cmd_nchunks(cmd::Int) = (cmd >> CMD_BITS) & CMD_MASK
 @inline cmd_skip(cmd::Int) = (cmd >> (2 * CMD_BITS)) & CMD_MASK
 @inline cmd_has_scope(cmd::Int) = (cmd & SCOPE_BIT) != 0
-@inline cmd_has_payload(cmd::Int) = (cmd & PAYLOAD_BIT) != 0
 
 """
     TeamScheduler()
@@ -173,43 +169,34 @@ pad_after() = ntuple(_ -> 0, Val(PAD_AFTER))
 
 # Shared chunk counter of a `GreedyTeamScheduler` region, on its own cache line
 mutable struct ChunkCounter
-    _pad0::PadBefore
+    const _pad0::PadBefore
     @atomic next::Int
-    _pad1::PadAfter
+    const _pad1::PadAfter
 end
 ChunkCounter() = ChunkCounter(pad_before(), 0, pad_after())
 
-# The chunk function is handed to a worker as a copy of its bytes (the field of the
-# dispatcher's slot, see `job_slot`) in a buffer of the worker, if it fits into
-# `PAYLOAD_BYTES`; the worker copies them into a slot of its own (see `worker_slots`).
-# Reading the dispatcher's slot instead, which the dispatcher writes in every region, cost
-# every worker a cache miss after the one that brings it the command (about 40 ns of the
-# hand-off with 4 threads). The buffer is written in every region as well, but the worker
-# also loads its lines while it waits for a command, so that the stores of the buffer and
-# of the command reach it together. The dispatcher's slot is then read by the dispatcher
-# only, and stays in its cache.
-const PAYLOAD_BYTES = 256
-const PAYLOAD_LINES = PAYLOAD_BYTES ÷ CACHE_LINE
-const PAYLOAD_WORDS = PAYLOAD_BYTES ÷ 8
-
-# The buffer of a worker: `PAYLOAD_BYTES` aligned to the cache line, so that it shares no
-# line with anything else (the object is 16-byte aligned; `CACHE_LINE` bytes of slack)
-mutable struct PayloadBuffer
-    words::NTuple{PAYLOAD_WORDS + CACHE_LINE ÷ 8, UInt64}
-end
-function payload_pointer(buf::PayloadBuffer)
-    p = UInt(pointer_from_objref(buf))
-    return Ptr{UInt64}((p + CACHE_LINE - 1) & ~UInt(CACHE_LINE - 1))
-end
+# The chunk function is stored by the dispatcher into a slot of each worker (see
+# `worker_slots`), with a typed store (`setfield!`, so with the write barrier of the GC:
+# the slots are old, the captures of the chunk function may be young), if its field takes
+# at most `COPY_BYTES`; a larger one is run from the dispatcher's slot by every worker.
+# Reading the dispatcher's slot, which the dispatcher writes in every region, costs every
+# worker a cache miss after the one that brings it the command (about 40 ns of the
+# hand-off with 4 threads). A worker's own slot is written in every region as well, but
+# the worker also loads the lines of the slots it used last (`RECENT_SLOTS` of them, see
+# `note_slot!`) while it waits for a command, so that for a loop body of one of those
+# types the stores of the slot and of the command reach it together. The dispatcher's slot
+# is then read by the dispatcher only, and stays in its cache.
+const COPY_BYTES = 256
+const RECENT_SLOTS = 4
 
 # A slot for a chunk function of type `F`: the dispatcher's (see `job_slot`) and the
 # workers' (see `worker_slots`). It is written in every region, so it is padded to keep
 # it off the cache lines of anything else (in particular of another worker's slot). The
 # slot is empty (`isdefined(slot, :x)` is false) outside of regions, see `clear_slot!`.
 mutable struct Slot{F}
-    _pad0::PadAfter
+    const _pad0::PadAfter
     x::F
-    _pad1::PadAfter
+    const _pad1::PadAfter
     Slot{F}() where {F} = new{F}()
 end
 Base.getindex(slot::Slot) = slot.x
@@ -217,6 +204,9 @@ Base.setindex!(slot::Slot{F}, f) where {F} = (slot.x = f; slot)
 # The number of bytes of a field of type `F`: the value itself if it is stored inline,
 # else a reference
 @inline field_bytes(::Type{F}) where {F} = sizeof(Base.RefValue{F})
+# Whether chunk functions of type `F` are stored into the workers' own slots (see
+# `COPY_BYTES`); a constant per type
+@inline own_slots(::Type{F}) where {F} = field_bytes(F) <= COPY_BYTES
 @inline slot_pointer(slot::Slot{F}) where {F} =
     pointer_from_objref(slot) + fieldoffset(Slot{F}, 2)
 # The command of a worker and the closure that runs the chunk function of the region (see
@@ -225,20 +215,20 @@ Base.setindex!(slot::Slot{F}, f) where {F} = (slot.x = f; slot)
 # the rest of the region data (see `cmd_base`), with the one cache line transfer that
 # brings it the command; the region data stored elsewhere (the scope) changes rarely.
 mutable struct WorkerState
-    _pad0::NTuple{PAD_BEFORE - 1, Int}
+    const _pad0::NTuple{PAD_BEFORE - 1, Int}
     @atomic cmd::Int
     @atomic job::Any
-    _pad1::PadAfter
-    # the buffer for the bytes of the chunk function (see `PAYLOAD_BYTES`) and its aligned
-    # start; the object keeps the buffer alive
-    const payload::PayloadBuffer
-    const payload_ptr::Ptr{UInt64}
+    const _pad1::PadAfter
+    # the cache lines of the slots the worker ran its last chunks from (see `note_slot!`),
+    # most recent first: the first line and the number of lines of each; written and read
+    # by the worker only
+    slot_lines::NTuple{RECENT_SLOTS, Ptr{UInt64}}
+    nslot_lines::NTuple{RECENT_SLOTS, Int}
 end
 function WorkerState()
-    buf = PayloadBuffer(ntuple(_ -> UInt64(0), Val(PAYLOAD_WORDS + CACHE_LINE ÷ 8)))
     return WorkerState(
-        ntuple(_ -> 0, Val(PAD_BEFORE - 1)), 0, nothing, pad_after(), buf,
-        payload_pointer(buf)
+        ntuple(_ -> 0, Val(PAD_BEFORE - 1)), 0, nothing, pad_after(),
+        ntuple(_ -> Ptr{UInt64}(0), Val(RECENT_SLOTS)), ntuple(_ -> 0, Val(RECENT_SLOTS))
     )
 end
 
@@ -247,9 +237,9 @@ end
 # `wake_chunk` (two per chunk, on the critical path of every worker) hit a line that stays
 # shared between all cores, instead of the line that the worker is claiming its chunk on.
 mutable struct SleepFlag
-    _pad0::PadBefore
+    const _pad0::PadBefore
     @atomic sleeping::Bool
-    _pad1::PadAfter
+    const _pad1::PadAfter
 end
 SleepFlag() = SleepFlag(pad_before(), false, pad_after())
 
@@ -421,7 +411,7 @@ end
 # see `new_job_closure`): a generic call (`jl_f_opaque_closure_call`, which works from the
 # older world of the worker too). The usual closure type is called directly by
 # `run_job_in_scope`.
-@inline function run_job(job, ws::Union{WorkerState, Nothing}, k::Int, chunk::Int)
+@inline function run_job(job, ws::WorkerState, k::Int, chunk::Int)
     job(ws, k, chunk)
     return nothing
 end
@@ -432,9 +422,6 @@ end
 # arguments.
 function run_job_in_scope(pool::Pool, ws::WorkerState, k::Int, cmd::Int)
     job = @atomic :monotonic ws.job
-    # The bytes of the chunk function are in the worker's buffer, or else the closure runs
-    # the dispatcher's slot (see `run_job_closure`)
-    wsp = cmd_has_payload(cmd) ? ws : nothing
     chunk = cmd_chunk(cmd)
     # The type check is here and not in `run_job`: called with the `Any`-typed closure,
     # `run_job` itself is a dynamic call (`ijl_apply_generic`, boxing its arguments), which
@@ -443,40 +430,41 @@ function run_job_in_scope(pool::Pool, ws::WorkerState, k::Int, cmd::Int)
         if !cmd_has_scope(cmd)
             # The common case (no `ScopedValue` or logger set by the caller, and the worker
             # runs without a scope): no scope to enter, and no exception handler for it
-            job(wsp, k, chunk)
+            job(ws, k, chunk)
         else
             scope = @atomic :monotonic pool.scope
-            @enter_scope scope job(wsp, k, chunk)
+            @enter_scope scope job(ws, k, chunk)
         end
     elseif !cmd_has_scope(cmd)
-        run_job(job, wsp, k, chunk)
+        run_job(job, ws, k, chunk)
     else
         scope = @atomic :monotonic pool.scope
-        @enter_scope scope run_job(job, wsp, k, chunk)
+        @enter_scope scope run_job(job, ws, k, chunk)
     end
     return nothing
 end
 
-# Copy `nbytes` bytes (rounded up to whole words: within both allocations, which are
-# padded to 8 bytes at least) from `src` to `dst`
-@inline function copy_words!(dst::Ptr, src::Ptr, nbytes::Int)
-    d = Ptr{UInt64}(dst)
-    s = Ptr{UInt64}(src)
-    for i in 1:cld(nbytes, 8)
-        unsafe_store!(d, unsafe_load(s, i), i)
+# Remember the cache lines of the field of `slot`, which the worker runs its chunk from,
+# for `wait_for_command` (see `COPY_BYTES`), in front of the ones remembered before (the
+# oldest is forgotten; the same slot may appear more than once). The slots live as long
+# as the process (see `job_slot`), so the lines stay valid.
+@inline function note_slot!(ws::WorkerState, slot::Slot{F}) where {F}
+    p = UInt(slot_pointer(slot))
+    first = p & ~UInt(CACHE_LINE - 1)
+    nlines = cld(Int(p - first) + field_bytes(F), CACHE_LINE)
+    lines = ws.slot_lines
+    nls = ws.nslot_lines
+    if lines[1] != Ptr{UInt64}(first)
+        ws.slot_lines = ntuple(i -> i == 1 ? Ptr{UInt64}(first) : lines[i - 1], Val(RECENT_SLOTS))
+        ws.nslot_lines = ntuple(i -> i == 1 ? nlines : nls[i - 1], Val(RECENT_SLOTS))
     end
     return nothing
 end
 
-# Run chunk `chunk` with the chunk function whose bytes are at `src` (the buffer of the
-# worker): copied into the worker's slot `slot` and dropped from it afterwards (when the
-# chunk throws, by the dispatcher at the end of the region, see `dispatch!`). The references
-# the bytes may hold are kept alive by the dispatcher's slot during the region. They are
-# written into the slot without the write barrier of the GC: it does not need one, since
-# the slot never holds anything that the dispatcher's slot (stored with the barrier) does
-# not hold too.
-@inline function run_job_copy(slot::Slot{F}, src::Ptr{UInt64}, chunk::Int) where {F}
-    GC.@preserve slot copy_words!(slot_pointer(slot), src, field_bytes(F))
+# Run chunk `chunk` with the chunk function in the worker's own slot `slot` (stored there
+# by the dispatcher, see `dispatch!`) and drop it from the slot afterwards (when the chunk
+# throws, the dispatcher does that at the end of the region)
+@inline function run_job_own(slot::Slot{F}, chunk::Int) where {F}
     run_chunk(slot, chunk)
     clear_slot!(slot)
     return nothing
@@ -491,13 +479,14 @@ function wait_for_command(
     spins = 0
     t0 = time_ns()
     tyield = tevents = t0
-    payload = ws.payload_ptr
+    lines = ws.slot_lines
+    nlines = ws.nslot_lines
     while true
-        # Fetch the lines of the payload buffer together with the command (see
-        # `PAYLOAD_BYTES`). Only to warm the cache: the values are not used (and atomic
-        # loads are not removed by the compiler).
-        for i in 0:(PAYLOAD_LINES - 1)
-            unsafe_load(payload + i * CACHE_LINE, :monotonic)
+        # Fetch the lines of the slots used last together with the command (see
+        # `COPY_BYTES`). Only to warm the cache: the values are not used (and atomic loads
+        # are not removed by the compiler).
+        for j in 1:RECENT_SLOTS, i in 0:(nlines[j] - 1)
+            unsafe_load(lines[j] + i * CACHE_LINE, :monotonic)
         end
         # Relaxed: the claim below acquires the region data (published by the release store
         # of the command)
@@ -585,7 +574,7 @@ end
             @atomic :release ws.cmd = 0
         end
     catch err
-        # (The dispatcher drops the copy of the chunk function, see `run_job_copy`)
+        # (The dispatcher drops the chunk function from the worker's slot, see `dispatch!`)
         pool.errs[k] = CapturedException(err, catch_backtrace())
         @atomic :release ws.cmd = 0
     end
@@ -680,17 +669,17 @@ end
 end
 
 # The slot of the dispatcher for the chunk function of type `F`: already allocated, so
-# storing the function does not allocate (no boxing). The workers get a copy of its bytes
-# (see `PAYLOAD_BYTES`), or the slot itself if the function is too large. One per type `F`,
-# created when the generated function is first specialized for `F` and embedded in its
-# body as a constant, so that getting it costs nothing (a dictionary lookup keyed by the
-# type costs about 25 ns). Only used while holding `POOL.busy`, and cleared after every
-# region.
+# storing the function does not allocate (no boxing). The workers get a copy in a slot of
+# their own (see `COPY_BYTES`), or run from this slot if the function is too large. One
+# per type `F`, created when the generated function is first specialized for `F` and
+# embedded in its body as a constant, so that getting it costs nothing (a dictionary
+# lookup keyed by the type costs about 25 ns). Only used while holding `POOL.busy`, and
+# cleared after every region.
 @generated function job_slot(::Type{F}) where {F}
     return :($(Slot{F}()))
 end
 
-# The slots of the workers for chunk functions of type `F` (see `run_job_copy`): slot `k`
+# The slots of the workers for chunk functions of type `F` (see `COPY_BYTES`): slot `k`
 # is only used by worker `k`, so that it stays in the cache of the worker. Padded, so that
 # the slots of two workers never share a cache line. Created, as `job_slot`, once per type;
 # grown when a region first needs them.
@@ -710,9 +699,8 @@ end
 end
 
 # The closure that the workers call to run a chunk, as `job(ws, k, chunk)`: worker `k`
-# copies the bytes of the chunk function from the buffer of its `WorkerState` `ws` into its
-# own slot `worker_slot_vector(F)[k]` and runs the chunk from there (`run_job_copy`), or,
-# if `ws` is `nothing` (a chunk function larger than `PAYLOAD_BYTES`), runs it from the
+# (whose `WorkerState` is `ws`) runs the chunk from its own slot `worker_slot_vector(F)[k]`
+# (`run_job_own`), or, for a chunk function larger than `COPY_BYTES`, from the
 # dispatcher's slot `job_slot(F)` (`run_chunk`).
 #
 # An opaque closure runs its body in the world age it was created in (set on entry and
@@ -757,10 +745,14 @@ end
 @inline function run_job_closure(
         slot::Slot{F}, wslots::Vector{Slot{F}}, ws, k::Int, chunk::Int
     ) where {F}
-    if ws === nothing
-        run_chunk(slot, chunk)
+    if own_slots(F)
+        wslot = @inbounds wslots[k]
+        note_slot!(ws::WorkerState, wslot)
+        run_job_own(wslot, chunk)
     else
-        run_job_copy(@inbounds(wslots[k]), (ws::WorkerState).payload_ptr, chunk)
+        # (Not noted: every worker would then keep loading the lines of the dispatcher's
+        # slot, which the dispatcher writes in every region)
+        run_chunk(slot, chunk)
     end
     return nothing
 end
@@ -902,13 +894,11 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
     scope = current_scope()
     has_scope = scope !== nothing
     has_scope && (@atomic :monotonic pool.scope = scope)
-    # Hand the chunk function to the workers as bytes if it fits (see `PAYLOAD_BYTES`)
-    nbytes = field_bytes(F)
-    payload = cld(nbytes, 8) * 8 <= PAYLOAD_BYTES
-    # The workers' slots are only used (and only need to exist) for a chunk function that
-    # is handed as bytes
-    wslots = payload ? worker_slots(F, length(pool.workers)) : worker_slot_vector(F)
-    base = cmd_base(n, skip, has_scope, payload)
+    # Store the chunk function into the workers' own slots if it is small (see
+    # `COPY_BYTES`); the slots only need to exist then
+    copies = own_slots(F)
+    wslots = copies ? worker_slots(F, length(pool.workers)) : worker_slot_vector(F)
+    base = cmd_base(n, skip, has_scope)
     try
         # Decreasing chunk order: see `wake_children`
         for chunk in n:-1:2
@@ -916,7 +906,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
             # A worker can still be busy if a previous region was interrupted
             if !wait_idle(pool, k)
                 # Take back the chunks already handed out before giving up
-                cancel_chunks(pool, chunk + 1, n, skip, base)
+                cancel_chunks(pool, chunk + 1, n, skip, base, wslots, copies)
                 wait_workers(pool, chunk + 1, n, skip)
                 dead_worker_error(k)
             end
@@ -929,7 +919,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
             # weakly ordered machine, `wait_idle` re-notifies sleeping workers with pending
             # commands, so the region only takes longer.
             ws = @inbounds pool.workers[k]
-            payload && GC.@preserve slot copy_words!(ws.payload_ptr, slot_pointer(slot), nbytes)
+            copies && (@inbounds(wslots[k])[] = f)
             @atomic :monotonic ws.job = job
             @atomic :release ws.cmd = base | chunk
         end
@@ -941,16 +931,16 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         catch
             # Cancel the chunks that were not started and wait for the others: never leave
             # workers running when returning from the region
-            cancel_chunks(pool, 2, n, skip, base)
+            cancel_chunks(pool, 2, n, skip, base, wslots, copies)
             wait_workers(pool, 2, n, skip)
             rethrow()
         end
         # The chunks that their worker has not claimed yet: a greedy region only takes them
         # back, a static one runs them
         if f isa GreedyJob
-            take_back_chunks(pool, n, skip, base)
+            take_back_chunks(pool, n, skip, base, wslots, copies)
         else
-            steal_chunks(pool, slot, n, skip, base)
+            steal_chunks(pool, slot, n, skip, base, wslots, copies)
         end
         wait_workers(pool, 2, n, skip)
         for chunk in 2:n
@@ -966,14 +956,12 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         has_scope && (@atomic :monotonic pool.scope = nothing)
         for chunk in 2:n
             k = worker_for_chunk(chunk, skip)
-            # A worker whose chunk threw left its copy of the chunk function in its slot
-            # (see `run_job_copy`), and so may have a worker that died with its command
-            # still set (see `dead_worker_error`; every live worker is idle here). The copy
-            # was stored without a write barrier, so it must not outlive the dispatcher's
-            # slot, which was cleared above: clear it before anything can run the GC.
+            # A worker whose chunk threw left the chunk function in its slot (see
+            # `run_job_own`), and so may have a worker that died with its command still set
+            # (see `dead_worker_error`; every live worker is idle here)
             if (@inbounds pool.errs[k]) !== nothing ||
                     (@atomic :monotonic (@inbounds pool.workers[k]).cmd) != 0
-                payload && clear_slot!(@inbounds wslots[k])
+                copies && clear_slot!(@inbounds wslots[k])
                 @inbounds pool.errs[k] = nothing
             end
         end
@@ -992,13 +980,20 @@ end
 # the worker's cache (and the worker's final store `cmd = 0` takes it back); a load only
 # shares it. Relaxed: nothing of the worker's is read after a successful steal, and
 # `wait_workers` acquires the results of the workers that did claim their chunk.
-@inline function steal_chunks(pool::Pool, slot, n::Int, skip::Int, base::Int)
+#
+# The worker of a stolen chunk never runs it, so it does not drop the chunk function from
+# its slot (see `run_job_own`): the dispatcher does, right away (the slot is still in its
+# cache; `copies`, see `dispatch!`).
+@inline function steal_chunks(
+        pool::Pool, slot, n::Int, skip::Int, base::Int, wslots, copies::Bool
+    )
     for chunk in 2:n
         k = worker_for_chunk(chunk, skip)
         ws = @inbounds pool.workers[k]
         cmd = base | chunk
         if (@atomic :monotonic ws.cmd) == cmd &&
                 (@atomicreplace :monotonic ws.cmd cmd => 0).success
+            copies && clear_slot!(@inbounds wslots[k])
             @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + 1
             # We took over the chunk, and with it the wake-ups of its children
             wake_children(pool, cmd)
@@ -1018,8 +1013,10 @@ end
 # workers of their children, would be wasted work. (The children are taken back as well,
 # unless their worker claims first. A worker that is not woken stays asleep, so a burst of
 # regions shorter than a wake-up recruits one level of the wake-up tree per region.)
-@inline function take_back_chunks(pool::Pool, n::Int, skip::Int, base::Int)
-    taken = cancel_chunks(pool, 2, n, skip, base)
+@inline function take_back_chunks(
+        pool::Pool, n::Int, skip::Int, base::Int, wslots, copies::Bool
+    )
+    taken = cancel_chunks(pool, 2, n, skip, base, wslots, copies)
     @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + taken
     return nothing
 end
@@ -1038,14 +1035,17 @@ function stolen_chunks()
 end
 
 # Take the chunks `from:n` away from the workers that have not claimed them yet; returns
-# how many. A load first, relaxed: see `steal_chunks`.
-@inline function cancel_chunks(pool::Pool, from, n, skip, base)
+# how many. A load first, relaxed: see `steal_chunks`, as for dropping the chunk function
+# from the slots of the workers that will not run their chunk.
+@inline function cancel_chunks(pool::Pool, from, n, skip, base, wslots, copies::Bool)
     taken = 0
     for chunk in from:n
-        ws = @inbounds pool.workers[worker_for_chunk(chunk, skip)]
+        k = worker_for_chunk(chunk, skip)
+        ws = @inbounds pool.workers[k]
         cmd = base | chunk
         if (@atomic :monotonic ws.cmd) == cmd &&
                 (@atomicreplace :monotonic ws.cmd cmd => 0).success
+            copies && clear_slot!(@inbounds wslots[k])
             taken += 1
         end
     end
