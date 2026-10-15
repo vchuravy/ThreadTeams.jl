@@ -76,7 +76,7 @@ thread's time goes:
 
 A worker claims its chunk within about 20 ns of the stores and is done about 100–150 ns
 later, of which the chunk itself is about 60 ns. The rest of its time is the wake-up check
-for its two children in the binary tree and the world-age call into the chunk function.
+for its two children in the binary tree and the call of the chunk closure (see `job_closure` in `src/pool.jl`).
 
 Four details keep the hand-off at that level:
 
