@@ -420,8 +420,7 @@ end
 # Call the closure of the current region, which runs the chunk in the world age of the
 # dispatcher. A direct call of its compiled body for the usual closure type; a generic
 # call (`jl_f_opaque_closure_call`, which works from the older world of the worker too)
-# for a closure with another return type, see `new_job_closure`. (Julia 1.12 emits a
-# generic call for both, see `JobClosure`.)
+# for a closure with another return type, see `new_job_closure`.
 @inline function run_job(job, ws::Union{WorkerState, Nothing}, k::Int, chunk::Int)
     if job isa JobClosure
         job(ws, k, chunk)
@@ -440,13 +439,24 @@ function run_job_in_scope(pool::Pool, ws::WorkerState, k::Int, cmd::Int)
     # The bytes of the chunk function are in the worker's buffer, or else the closure runs
     # the dispatcher's slot (see `run_job_closure`)
     wsp = cmd_has_payload(cmd) ? ws : nothing
-    if !cmd_has_scope(cmd)
-        # The common case (no `ScopedValue` or logger set by the caller, and the worker runs
-        # without a scope): no scope to enter, and no exception handler for it
-        run_job(job, wsp, k, cmd_chunk(cmd))
+    chunk = cmd_chunk(cmd)
+    # The type check is here and not in `run_job`: called with the `Any`-typed closure,
+    # `run_job` itself is a dynamic call (`ijl_apply_generic`, boxing its arguments), which
+    # would come before the direct call of the closure's compiled body.
+    if job isa JobClosure
+        if !cmd_has_scope(cmd)
+            # The common case (no `ScopedValue` or logger set by the caller, and the worker
+            # runs without a scope): no scope to enter, and no exception handler for it
+            job(wsp, k, chunk)
+        else
+            scope = @atomic :monotonic pool.scope
+            @enter_scope scope job(wsp, k, chunk)
+        end
+    elseif !cmd_has_scope(cmd)
+        run_job(job, wsp, k, chunk)
     else
         scope = @atomic :monotonic pool.scope
-        @enter_scope scope run_job(job, wsp, k, cmd_chunk(cmd))
+        @enter_scope scope run_job(job, wsp, k, chunk)
     end
     return nothing
 end
@@ -715,10 +725,11 @@ end
 # older than most chunk functions, and `invoke_in_world` (`Core._call_in_world`) costs a
 # generic method lookup in a world other than the current one plus a boxed call on every
 # chunk of every worker, about 20 ns on the critical path of each worker (Julia 1.10 to
-# 1.13), against 3 ns for the closure call. The call of the closure in `run_job` is a
-# generic one (`jl_apply_generic`, Julia 1.12) that boxes its arguments, so they are ones
-# whose boxing does not allocate: an object (or `nothing`) and two small integers
-# (`jl_box_int64` returns preallocated boxes for them).
+# 1.13), against 3 ns for the closure call. `run_job_in_scope` checks the type of the
+# closure and calls its compiled body directly (no boxing). Only a closure of another type
+# (see `new_job_closure`) goes through the generic call in `run_job`, which boxes its
+# arguments; they are ones whose boxing does not allocate for up to several hundred
+# workers: an object (or `nothing`) and two small integers.
 #
 # One closure per type `F`, kept in a per-type cache like `job_slot` and reused while the
 # dispatcher's world age is the one it was created in. The first loop after a method
