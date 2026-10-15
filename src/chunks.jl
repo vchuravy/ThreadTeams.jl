@@ -43,5 +43,12 @@ end
 @inline function chunk_range(A, c::Int, n::Int)
     r = firstindex(A):lastindex(A)
     n == 1 && return r
+    # One element per chunk, e.g. the `chunks(...; n = nthreads())` of a `TeamScheduler`
+    # loop: skip ChunkSplitters' index arithmetic (integer divisions) on the critical path
+    # of every chunk
+    if n == length(r)
+        i = first(r) + (c - 1)
+        return i:i
+    end
     return r[index_chunks(r; n)[c]]
 end
