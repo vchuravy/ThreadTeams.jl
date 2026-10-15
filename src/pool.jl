@@ -229,8 +229,8 @@ Longer spinning makes parallel loops that follow each other with short serial ga
 (waking up a sleeping worker costs about 10 µs), but idle workers keep their CPU busy for
 that long after every loop. `0` makes workers go to sleep as soon as they notice that the
 pool is idle, which they check every 64 spins (about 100 ns): loops that follow each other
-within that time keep them awake (lowest CPU use, highest latency). To keep the workers spinning only during a part of the program, use
-[`ThreadTeams.parallel_phase`](@ref).
+within that time keep them awake (lowest CPU use, highest latency). To keep the workers
+spinning only during a part of the program, use [`ThreadTeams.parallel_phase`](@ref).
 
 On CPUs with performance and efficiency cores (recent Intel CPUs, Apple silicon), spinning
 cores take power and turbo headroom from the busy ones. LLVM's and GCC's OpenMP runtimes
@@ -828,15 +828,11 @@ end
 # dispatcher's own participant returns, the counter has handed out every chunk (or a chunk
 # threw), so these participants would find no chunk left: running them, or waking the
 # workers of their children, would be wasted work. (The children are taken back as well,
-# unless their worker claims first.) A load first, relaxed: see `steal_chunks`.
+# unless their worker claims first. A worker that is not woken stays asleep, so a burst of
+# regions shorter than a wake-up recruits one level of the wake-up tree per region.)
 @inline function take_back_chunks(pool::Pool, n::Int, skip::Int)
-    for chunk in 2:n
-        ws = @inbounds pool.workers[worker_for_chunk(chunk, skip)]
-        if (@atomic :monotonic ws.cmd) == chunk &&
-                (@atomicreplace :monotonic ws.cmd chunk => 0).success
-            @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + 1
-        end
-    end
+    taken = cancel_chunks(pool, 2, n, skip)
+    @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + taken
     return nothing
 end
 
@@ -853,13 +849,18 @@ function stolen_chunks()
     return pool === nothing ? 0 : @atomic :monotonic pool.stolen
 end
 
-# Take the chunks `from:n` away from the workers that have not claimed them yet
+# Take the chunks `from:n` away from the workers that have not claimed them yet; returns
+# how many. A load first, relaxed: see `steal_chunks`.
 @inline function cancel_chunks(pool::Pool, from, n, skip)
+    taken = 0
     for chunk in from:n
-        k = worker_for_chunk(chunk, skip)
-        @atomicreplace :monotonic (@inbounds pool.workers[k]).cmd chunk => 0
+        ws = @inbounds pool.workers[worker_for_chunk(chunk, skip)]
+        if (@atomic :monotonic ws.cmd) == chunk &&
+                (@atomicreplace :monotonic ws.cmd chunk => 0).success
+            taken += 1
+        end
     end
-    return nothing
+    return taken
 end
 
 # Wait until the workers of chunks `from:n` are idle. A dead worker is reported only after

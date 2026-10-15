@@ -15,7 +15,9 @@ How a parallel operation runs on the team, and what that means for the code insi
   the same thread. Prefer buffers indexed by the task index (`@task_index`,
   `OhMyThreads.WithTaskIndex`), which is the chunk index. With `GreedyTeamScheduler`, the
   shared counter balances the load already: the calling task takes back the workers that
-  have not started when its own share is done, since no chunk is left for them.
+  have not started when its own share is done, since no chunk is left for them. Workers
+  taken back are not woken, so after a serial gap a burst of short greedy loops brings the
+  sleeping workers in over a few loops rather than all at once.
   `ThreadTeams.stolen_chunks()` counts the chunks taken over (or back) this way.
 - **Serial fallback.** The loop runs serially when it would get a single chunk: one thread,
   zero or one element, during precompilation, and inside another parallel loop on the team
