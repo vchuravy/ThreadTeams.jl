@@ -263,7 +263,7 @@ mutable struct Pool
     const counter::ChunkCounter
     const greedy_errs::Vector{Any}
     const greedy_errchunks::Vector{Int}
-    # more Julia threads than CPUs available to the process: spinning workers then give
+    # Julia threads have to share CPUs (`is_oversubscribed`): spinning workers then give
     # their CPU to other OS threads now and then
     const oversubscribed::Bool
     # Chunks the dispatcher took over from their worker (`steal_chunks`); written only by
@@ -350,11 +350,56 @@ end
     end
 end
 
-# More Julia threads than CPUs this process may run on (affinity mask), e.g. `-t N` on N
-# cores with Julia ≥ 1.12, which adds an interactive thread
+# More Julia threads than CPUs they may run on, e.g. `-t N` on N cores with Julia ≥ 1.12
+# (which adds an interactive thread), `taskset`, a cgroup CPU quota, or threads pinned
+# (e.g. with ThreadPinning.jl) so that several of them share a CPU. Checked when the pool is
+# created (`ThreadTeams.shutdown!()` makes the next loop check again).
 function is_oversubscribed()
-    nt = Threads.threadpoolsize(:default) + Threads.threadpoolsize(:interactive)
-    return nt > Int(ccall(:uv_available_parallelism, Cuint, ()))
+    tids = vcat(Threads.threadpooltids(:interactive), Threads.threadpooltids(:default))
+    nt = length(tids)
+    # CPUs of the calling thread's affinity mask, limited by the cgroup CPU quota
+    navail = Int(ccall(:uv_available_parallelism, Cuint, ()))
+    masks = thread_affinity_masks(tids)
+    masks === nothing && return nt > navail
+    oversubscribed_masks(masks) && return true
+    # The quota is only known through `uv_available_parallelism`, which also counts the
+    # affinity mask of the calling thread; use it only when that thread may run on all the
+    # CPUs of the other threads (else a pinned caller would count as oversubscription)
+    k = findfirst(==(Threads.threadid()), tids)
+    return k !== nothing && masks[k] == reduce(.|, masks) && nt > navail
+end
+
+# Affinity mask of each thread in `tids` as a `BitVector` (Julia ≥ 1.11, where the runtime
+# can query the affinity of another thread), or `nothing` if it is not available (Julia
+# 1.10, or an OS where libuv does not support thread affinity, e.g. macOS)
+function thread_affinity_masks(tids)
+    @static if VERSION >= v"1.11-"
+        sz = Int(ccall(:uv_cpumask_size, Cint, ()))
+        sz > 0 || return nothing
+        buf = zeros(Cchar, sz)
+        masks = BitVector[]
+        for tid in tids
+            ret = ccall(:jl_getaffinity, Int32, (Int16, Ptr{Cchar}, Int32), tid - 1, buf, sz)
+            ret == 0 || return nothing
+            push!(masks, BitVector(!iszero(c) for c in buf))
+        end
+        return masks
+    else
+        return nothing
+    end
+end
+
+# Do these threads (one affinity mask each) have to share CPUs? Hall's condition for a
+# thread-to-CPU matching, checked for the masks of the threads and their union: e.g. two
+# threads pinned to the same CPU, or more threads than CPUs in a common mask.
+function oversubscribed_masks(masks::AbstractVector{<:AbstractVector{Bool}})
+    isempty(masks) && return false
+    count(reduce(.|, masks)) < length(masks) && return true
+    for m in masks
+        nsub = count(s -> all(s .<= m), masks)
+        nsub > count(m) && return true
+    end
+    return false
 end
 
 # The caller's dynamic scope, and a macro to run code in it. Julia ≥ 1.11 keeps

@@ -126,3 +126,19 @@ end
         @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
     end
 end
+
+# Oversubscription from the threads' affinity masks (e.g. after ThreadPinning.jl's
+# `pinthreads`): Julia threads that have to share CPUs
+@testset "oversubscribed affinity masks" begin
+    mask(cpus...; n = 8) = [i - 1 in cpus for i in 1:n]
+    over = ThreadTeams.oversubscribed_masks
+    @test !over([mask(0), mask(1), mask(2), mask(3)])                 # pinthreads(:cores)
+    @test over([mask(0), mask(0), mask(1), mask(1)])                  # pinthreads([0, 0, 1, 1])
+    @test !over([mask(0:7...), mask(0), mask(1)])                     # unpinned main thread
+    @test over([mask(0, 1), mask(0, 1), mask(0, 1)])                  # taskset -c 0,1, -t 3
+    @test !over([mask(0, 1), mask(0, 1), mask(2)])
+    @test over([mask(0:7...), mask(0), mask(0)])
+    @test !over([mask(0:7...) for _ in 1:8])
+    @test over([mask(0:7...) for _ in 1:9])
+    @test ThreadTeams.is_oversubscribed() isa Bool
+end
