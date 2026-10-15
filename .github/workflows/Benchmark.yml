@@ -22,6 +22,14 @@ jobs:
     if: contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Julia 1.13.2's `Pkg.add` precompiles the packages whose version changed, by name,
+      # and fails with "Unknown package: Parsers" when one of them is an indirect
+      # dependency (JuliaLang/Pkg.jl#4866, fixed by #4867 for 1.13.3). AirspeedVelocity
+      # adds its packages in two steps, the second of which changes `Parsers`, and then
+      # runs `Pkg.precompile()` itself; turning off the precompilation inside `Pkg.add`
+      # avoids the failing path. Remove once the runners' Julia 1 has the fix.
+      JULIA_PKG_PRECOMPILE_AUTO: 0
     steps:
       - uses: MilesCranmer/AirspeedVelocity.jl@action-v1
         with:
