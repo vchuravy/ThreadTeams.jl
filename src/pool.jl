@@ -749,7 +749,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         # Chunk 1 is ours: wake the workers of chunks 2 and 3, they wake the others
         wake_children(pool, 1, n, skip)
         try
-            f(1)
+            run_job(slot, 1)   # the workers' code, see `run_job`
         catch
             # Cancel the chunks that were not started and wait for the others: never leave
             # workers running when returning from the region
@@ -770,7 +770,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
                 # We took over the chunk, and with it the wake-ups of its children
                 wake_children(pool, chunk, n, skip)
                 try
-                    f(chunk)
+                    run_job(slot, chunk)
                 catch err
                     @inbounds pool.errs[k] = CapturedException(err, catch_backtrace())
                 end
