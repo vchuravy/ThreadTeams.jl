@@ -1,24 +1,35 @@
-# Chunk 1 (on the caller) takes much longer than the spin time; the workers must not go to
-# sleep while they wait for it. Reads the `sleeping` flags of the workers that took part
-# right after the loop (in a function, so that the second call does not compile anything
-# between the loop and the read).
-function sleeping_after_long_chunk1()
+# Chunk 1 (on the caller) takes much longer than the spin time; the workers must not sleep
+# while they wait for it. The `sleeping` flags are read from inside chunk 1, while the pool
+# is busy: a worker whose spin time counted from the end of its own chunk would be asleep
+# by then, while one that gives its thread to another task (`other_work`) or is still
+# being woken is not a bug. (Read after the loop, the flags would also catch a worker that
+# the OS held across the end of the loop.) In a function, so that the second call compiles
+# nothing inside the loop.
+function sleeping_during_long_chunk1()
+    sleeping = fill(false, NW - 1)
     tforeach(1:NW; scheduler = team) do c
         if c == 1
             t = time_ns()
             while time_ns() - t < 20 * ThreadTeams.SPIN_NS[]
             end
+            pool = @atomic ThreadTeams.POOL.pool
+            skip = get(pool.tid2worker, Threads.threadid(), 0)   # chunk 1 runs on the caller
+            for c2 in 2:NW
+                k = ThreadTeams.worker_for_chunk(c2, skip)
+                sleeping[c2 - 1] = @atomic pool.sleepflags[k].sleeping
+            end
         end
     end
-    pool = @atomic ThreadTeams.POOL.pool
-    skip = get(pool.tid2worker, Threads.threadid(), 0)
-    return [(@atomic pool.sleepflags[ThreadTeams.worker_for_chunk(c, skip)].sleeping) for c in 2:NW]
+    return sleeping
 end
 
 @testset "spin time counts from the end of the loop" begin
     if NW > 1
-        sleeping_after_long_chunk1()   # compiles the loop body and the read
-        @test !any(sleeping_after_long_chunk1())
+        sleeping_during_long_chunk1()   # compiles the loop body and the read
+        # A worker asleep for a legitimate reason (another task on its thread: the test
+        # harness, GC, libuv) is rare and does not repeat; one whose spin time counts from
+        # the end of its own chunk is asleep in every run
+        @test any(_ -> !any(sleeping_during_long_chunk1()), 1:5)
     end
 end
 

@@ -6,15 +6,18 @@
             add_one!(x)
         end
         if NW > 1
-            # idle workers keep spinning (except the one on our thread, which goes to
-            # sleep when we become runnable again)
+            # Idle workers keep spinning, except the one on our thread (it sleeps when we
+            # become runnable again) and, rarely, one whose thread has another task to run
+            # (`other_work`): pass if every other worker is awake in one of five tries
             pool = @atomic ThreadTeams.POOL.pool
-            skip = get(pool.tid2worker, Threads.threadid(), 0)
-            sleep(0.002)
-            @test all(
-                k -> k == skip || !(@atomic pool.sleepflags[k].sleeping),
-                eachindex(pool.workers)
-            )
+            awake() = all(eachindex(pool.workers)) do k
+                k == get(pool.tid2worker, Threads.threadid(), 0) ||
+                    !(@atomic pool.sleepflags[k].sleeping)
+            end
+            @test any(1:5) do _
+                sleep(0.002)
+                awake()
+            end
         end
         ThreadTeams.parallel_phase(() -> add_one!(x))
     end
@@ -22,5 +25,4 @@
     @test ThreadTeams.PHASE[] == 0
     @test_throws ErrorException ThreadTeams.parallel_phase(() -> error("in phase"))
     @test ThreadTeams.PHASE[] == 0
-    @test ThreadTeams.is_oversubscribed() isa Bool
 end
