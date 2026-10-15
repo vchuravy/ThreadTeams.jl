@@ -228,8 +228,9 @@ other chunks. Takes effect the next time a worker starts waiting.
 
 Longer spinning makes parallel loops that follow each other with short serial gaps cheaper
 (waking up a sleeping worker costs about 10 µs), but idle workers keep their CPU busy for
-that long after every loop. `0` makes workers go to sleep right away (lowest CPU use,
-highest latency). To keep the workers spinning only during a part of the program, use
+that long after every loop. `0` makes workers go to sleep as soon as they notice that the
+pool is idle, which they check every 64 spins (about 100 ns): loops that follow each other
+within that time keep them awake (lowest CPU use, highest latency). To keep the workers spinning only during a part of the program, use
 [`ThreadTeams.parallel_phase`](@ref).
 
 On CPUs with performance and efficiency cores (recent Intel CPUs, Apple silicon), spinning
@@ -737,7 +738,9 @@ end
 # Run the chunks of a static region that their worker has not claimed yet. A worker that
 # spins claims its chunk within a cache-line transfer, so one that has not claimed it by
 # now is asleep or not running (the OS gave its CPU to another thread): waiting for it
-# would cost a wake-up or a time slice of the OS.
+# would cost a wake-up or a time slice of the OS. Cache locality: a stolen chunk is shorter
+# than that wake-up (the dispatcher ran its own chunk first), so it moves at most the data
+# that a core touches in that time, and fetching it back costs its worker about one chunk.
 #
 # A load first: a compare-and-swap on a line that the worker has just written takes it from
 # the worker's cache (and the worker's final store `cmd = 0` takes it back); a load only
