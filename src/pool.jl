@@ -22,10 +22,11 @@
 #    and world age.
 # 5. The caller runs chunk 1 itself. Then it "steals" every chunk that its worker has not
 #    claimed yet (a compare-and-swap of the command from `chunk` to `0`; the worker claims
-#    it with a swap to `RUNNING`) and runs it itself. This keeps the region from waiting
-#    for a worker that is asleep or whose thread the OS does not schedule (oversubscribed
-#    cores). Finally it waits until every worker it used is idle again, also when a chunk
-#    threw.
+#    it with a swap to `RUNNING`) and runs it itself (see `steal_chunks`). This keeps the
+#    region from waiting for a worker that is asleep or whose thread the OS does not
+#    schedule (oversubscribed cores). A greedy region only takes such chunks back (see
+#    `take_back_chunks`). Finally it waits until every worker it used is idle again, also
+#    when a chunk threw.
 #
 # Only one parallel region can be active at a time. The `busy` flag is taken with a
 # compare-and-swap. A loop nested in a region (started by a chunk) runs serially; a loop
@@ -197,6 +198,9 @@ mutable struct Pool
     # more Julia threads than CPUs available to the process: spinning workers then give
     # their CPU to other OS threads now and then
     const oversubscribed::Bool
+    # Number of chunks the dispatcher took over from their worker (see `steal_chunks`).
+    # Written only by the dispatcher, which holds `busy` (relaxed, no read-modify-write).
+    @atomic stolen::Int
 end
 
 # Global state. `busy` is held by the task running a parallel region (and by `shutdown!`);
@@ -475,7 +479,7 @@ function Pool()
         nothing, 0, 0, nothing, nothing, [WorkerState() for _ in 1:nw],
         [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw],
         tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
-        Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed()
+        Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed(), 0
     )
     # A new task inherits the dynamic scope of the task that creates it. The workers are
     # created without one, so that they neither keep the scope of the first caller alive
@@ -704,24 +708,12 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
             wait_workers(pool, 2, n, skip)
             rethrow()
         end
-        # Run the chunks not claimed by their worker yet. A load first: a compare-and-swap on
-        # a line that the worker has just written takes it from the worker's cache (and the
-        # worker's final store `cmd = 0` takes it back); a load only shares it. Relaxed:
-        # nothing of the worker's is read after a successful steal, and `wait_workers`
-        # acquires the results of the workers that did claim their chunk.
-        for chunk in 2:n
-            k = worker_for_chunk(chunk, skip)
-            ws = @inbounds pool.workers[k]
-            if (@atomic :monotonic ws.cmd) == chunk &&
-                    (@atomicreplace :monotonic ws.cmd chunk => 0).success
-                # We took over the chunk, and with it the wake-ups of its children
-                wake_children(pool, chunk, n, skip)
-                try
-                    run_job(slot, chunk)
-                catch err
-                    @inbounds pool.errs[k] = CapturedException(err, catch_backtrace())
-                end
-            end
+        # The chunks that their worker has not claimed yet: a greedy region only takes them
+        # back, a static one runs them
+        if f isa GreedyJob
+            take_back_chunks(pool, n, skip)
+        else
+            steal_chunks(pool, slot, n, skip)
         end
         wait_workers(pool, 2, n, skip)
         for chunk in 2:n
@@ -740,6 +732,63 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         end
     end
     return nothing
+end
+
+# Run the chunks of a static region that their worker has not claimed yet. A worker that
+# spins claims its chunk within a cache-line transfer, so one that has not claimed it by
+# now is asleep or not running (the OS gave its CPU to another thread): waiting for it
+# would cost a wake-up or a time slice of the OS.
+#
+# A load first: a compare-and-swap on a line that the worker has just written takes it from
+# the worker's cache (and the worker's final store `cmd = 0` takes it back); a load only
+# shares it. Relaxed: nothing of the worker's is read after a successful steal, and
+# `wait_workers` acquires the results of the workers that did claim their chunk.
+@inline function steal_chunks(pool::Pool, slot, n::Int, skip::Int)
+    for chunk in 2:n
+        k = worker_for_chunk(chunk, skip)
+        ws = @inbounds pool.workers[k]
+        if (@atomic :monotonic ws.cmd) == chunk &&
+                (@atomicreplace :monotonic ws.cmd chunk => 0).success
+            @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + 1
+            # We took over the chunk, and with it the wake-ups of its children
+            wake_children(pool, chunk, n, skip)
+            try
+                run_job(slot, chunk)
+            catch err
+                @inbounds pool.errs[k] = CapturedException(err, catch_backtrace())
+            end
+        end
+    end
+    return nothing
+end
+
+# Take back the participants of a greedy region that their worker has not claimed. When the
+# dispatcher's own participant returns, the counter has handed out every chunk (or a chunk
+# threw), so these participants would find no chunk left: running them, or waking the
+# workers of their children, would be wasted work. (The children are taken back as well,
+# unless their worker claims first.) A load first, relaxed: see `steal_chunks`.
+@inline function take_back_chunks(pool::Pool, n::Int, skip::Int)
+    for chunk in 2:n
+        ws = @inbounds pool.workers[worker_for_chunk(chunk, skip)]
+        if (@atomic :monotonic ws.cmd) == chunk &&
+                (@atomicreplace :monotonic ws.cmd chunk => 0).success
+            @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + 1
+        end
+    end
+    return nothing
+end
+
+"""
+    ThreadTeams.stolen_chunks() -> Int
+
+Number of chunks that the calling task ran (static regions) or took back (greedy regions)
+because their worker had not picked them up in time, since the pool was started. A high
+rate compared to the number of regions means that workers are often asleep or not running
+(an oversubscribed machine); for diagnosis and benchmarks.
+"""
+function stolen_chunks()
+    pool = @atomic POOL.pool
+    return pool === nothing ? 0 : @atomic :monotonic pool.stolen
 end
 
 # Take the chunks `from:n` away from the workers that have not claimed them yet

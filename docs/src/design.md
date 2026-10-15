@@ -13,7 +13,10 @@ How a parallel operation runs on the team, and what that means for the code insi
   the same time always run on different threads, so `threadid()`-indexed scratch buffers
   are safe as long as the body does not yield. Do not assume that chunk `c` always runs on
   the same thread. Prefer buffers indexed by the task index (`@task_index`,
-  `OhMyThreads.WithTaskIndex`), which is the chunk index.
+  `OhMyThreads.WithTaskIndex`), which is the chunk index. With `GreedyTeamScheduler`, the
+  shared counter balances the load already: the calling task takes back the workers that
+  have not started when its own share is done, since no chunk is left for them.
+  `ThreadTeams.stolen_chunks()` counts the chunks taken over (or back) this way.
 - **Serial fallback.** The loop runs serially when it would get a single chunk: one thread,
   zero or one element, during precompilation, and inside another parallel loop on the team
   (nested loops). OhMyThreads' own schedulers nested in a team loop are not affected.

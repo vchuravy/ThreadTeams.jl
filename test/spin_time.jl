@@ -42,6 +42,15 @@ end
             @test psum(y) == len
             sleep(0.0002)
         end
+        # greedy regions take back the participants of sleeping workers
+        stolen = ThreadTeams.stolen_chunks()
+        for _ in 1:50
+            counts = zeros(Int, 1000)
+            tforeach(i -> (counts[i] += 1), 1:1000; scheduler = GPS(chunksize = 1))
+            @test all(==(1), counts)
+            sleep(0.0005)
+        end
+        @test ThreadTeams.stolen_chunks() >= stolen
         @test_throws ArgumentError ThreadTeams.set_spin_time!(-1)
     finally
         ThreadTeams.set_spin_time!(old)
