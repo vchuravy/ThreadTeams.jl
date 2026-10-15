@@ -41,7 +41,9 @@ load with EnzymeCore.jl.
 - **Compared to Polyester.jl's `@batch`**: the same design (contiguous chunks, persistent
   spinning workers, nested loops run serially) at a slightly higher cost per loop (a few
   tens of nanoseconds). No LLVM-level threading runtime, no conversion of arrays to
-  `PtrArray`s; exceptions propagate, and the loop body is an ordinary closure.
+  `PtrArray`s; exceptions propagate, and the loop body is an ordinary closure. `@batch`
+  wraps the loop body in `@inbounds`; the team (like OhMyThreads) keeps bounds checks
+  unless the body has its own `@inbounds`. Compare the two with `@inbounds` in the body.
 
 ## Usage
 
