@@ -10,12 +10,12 @@ low per-loop overhead. The package re-exports the OhMyThreads.jl API (`tforeach`
 `TeamScheduler` (`:team`) and `GreedyTeamScheduler` (`:greedyteam`). It is plain Julia on
 top of Base tasks.
 
-There is one sticky worker task per thread of the `:default` thread pool. A parallel loop
+One sticky worker task runs per thread of the `:default` thread pool. A parallel loop
 splits its range into one contiguous chunk per thread, runs chunk 1 on the calling task and
-hands the other chunks to the workers. After a loop, idle workers spin for a short while
-(100 µs by default) before they go to sleep, so loops that follow each other closely do not
-pay for creating, scheduling and waking up tasks. Starting a loop costs about 0.3 µs and
-allocates nothing after the first run of that loop, against 2–4 µs and about 3 KB for
+hands the rest to the workers. After a loop, idle workers spin (100 µs by default) before
+they sleep, so back-to-back loops do not pay for creating, scheduling and waking tasks.
+Starting a loop costs about 0.3 µs and allocates nothing after its first run, against
+2–4 µs and about 3 KB for
 `Threads.@threads` or OhMyThreads' default scheduler (see the [overhead](https://vchuravy.github.io/ThreadTeams.jl/dev/overhead/) page).
 
 ## Installation
@@ -26,23 +26,22 @@ The package is not registered yet:
 pkg> add https://github.com/vchuravy/ThreadTeams.jl
 ```
 
-It needs Julia 1.10 or newer and depends on OhMyThreads.jl 0.8.7 and ChunkSplitters.jl; the
-Enzyme rules load with EnzymeCore.jl.
+It needs Julia 1.10 or newer, OhMyThreads.jl 0.8.7 and ChunkSplitters.jl; the Enzyme rules
+load with EnzymeCore.jl.
 
 ## When to use it
 
-- **Use it** for many small to medium parallel loops in a row, where the per-loop overhead
-  of `Threads.@threads` (2–4 µs) is a
-  noticeable part of the run time. A typical case is the right-hand side of a PDE solver,
-  which runs 10–20 loops of a few µs each per call.
+- **Use it** for many small to medium parallel loops in a row, where the 2–4 µs per loop of
+  `Threads.@threads` is a noticeable part of the run time. A typical case is the right-hand
+  side of a PDE solver: 10–20 loops of a few µs each per call.
 - **Use OhMyThreads' own schedulers** (`DynamicScheduler`, the default) for large loops,
-  where a few µs per loop do not matter. Use them also when loop bodies are unbalanced
-  beyond what `GreedyTeamScheduler` handles, when they yield (I/O, locks, `wait`), when you
-  need composable task-based parallelism or `@barrier`. Switching is one keyword argument.
+  where a few µs per loop do not matter, for loop bodies that are unbalanced beyond what
+  `GreedyTeamScheduler` handles or that yield (I/O, locks, `wait`), and for composable
+  task-based parallelism or `@barrier`. Switching is one keyword argument.
 - **Compared to Polyester.jl's `@batch`**: the same design (contiguous chunks, persistent
   spinning workers, nested loops run serially) at a slightly higher cost per loop (a few
-  tens of nanoseconds). No LLVM-level threading runtime, no conversion of arrays to `PtrArray`s,
-  exceptions are propagated, and the loop body is an ordinary closure.
+  tens of nanoseconds). No LLVM-level threading runtime, no conversion of arrays to
+  `PtrArray`s; exceptions propagate, and the loop body is an ordinary closure.
 
 ## Usage
 
@@ -84,21 +83,20 @@ end
 
 Everything else (`tforeach`, `tmapreduce`, `treduce`, `tmap`, `tmap!`, `tcollect`, `@tasks`,
 `@set`, `@local`, `@task_index`, `@allow_boxed_captures`, `chunks`, `index_chunks`, the other
-schedulers, ...) is OhMyThreads.jl, re-exported. The inputs of the team schedulers are
+schedulers, ...) is OhMyThreads.jl, re-exported. The team schedulers accept
 `AbstractArray`s (e.g. `eachindex(x)`, `1:n`, `CartesianIndices`, a `StepRange`, or an array
 to loop over by value) and `chunks`/`index_chunks` objects.
 
-The [documentation](https://vchuravy.github.io/ThreadTeams.jl/dev) describes the design
+The [documentation](https://vchuravy.github.io/ThreadTeams.jl/dev) covers the design
 (chunking, stealing, serial fallback, exceptions, dynamic scope, reductions), the measured
-overheads and the trade-offs and caveats (CPU use while idle, hybrid CPUs, automatic
+overheads, and the trade-offs and caveats (CPU use while idle, hybrid CPUs, automatic
 differentiation, captured variables).
 
 ## Development
 
-The code is formatted with [Runic.jl](https://github.com/fredrikekre/Runic.jl)
-(`julia -m Runic --inplace src test ext docs/make.jl benchmark`), which CI checks. A
-pre-commit hook that checks the staged files is in `.githooks`; enable it with
-`git config core.hooksPath .githooks`.
+CI checks that the code is formatted with [Runic.jl](https://github.com/fredrikekre/Runic.jl)
+(`julia -m Runic --inplace src test ext docs/make.jl benchmark`). A pre-commit hook in
+`.githooks` checks the staged files; enable it with `git config core.hooksPath .githooks`.
 
 ## License
 

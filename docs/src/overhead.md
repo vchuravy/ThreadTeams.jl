@@ -4,7 +4,7 @@ Per-loop time for a loop with 64 trivial iterations (`x[i] += 1.0`), `benchmark/
 pinned to 8 cores (`taskset -c 8-15`) of a Ryzen 9 5950X, Julia 1.12.7 and 1.13.1, `OPENBLAS_NUM_THREADS=1`. Polyester.jl 0.7.18 was
 loaded from a separate environment for comparison (\* on 1.13 from an earlier run, with
 0.7.19); OhMyThreads.jl 0.8.7 and KernelAbstractions.jl 0.10.0 (`foreach_index` on the
-`CPU` backend, followed by `synchronize`) come from the benchmark environment. Values are
+`CPU` backend, then `synchronize`) come from the benchmark environment. Values are
 min / median in µs.
 
 **These numbers come from one shared machine, with other jobs running on the same cores.
@@ -25,30 +25,29 @@ Minima are more reliable than medians.**
 | KernelAbstractions `foreach_index` (v0.10.0) | 3.24 / 4.61 | 3.17 / 4.48 | 3.13 / 4.20 | 3.08 / 4.38 | 5 (96 B) |
 | serial loop | 0.02 / 0.02 | 0.02 / 0.02 | 0.02 / 0.02 | 0.02 / 0.02 | 0 |
 
-- Pass the scheduler as an object. A symbol (`scheduler = :team`, `@set scheduler = :team`)
-  is resolved by OhMyThreads with a dynamic dispatch, which costs about 0.3 µs and 64 bytes
-  per loop.
-- `GreedyTeamScheduler()` splits the 64 iterations into 32 chunks (4 per thread) that are
-  handed out one by one, hence the higher cost; with `chunksize` or `nchunks` set to match
-  the loop, it costs about as much as the static schedule.
+- Pass the scheduler as an object. OhMyThreads resolves a symbol (`scheduler = :team`,
+  `@set scheduler = :team`) with a dynamic dispatch, about 0.3 µs and 64 bytes per loop.
+- `GreedyTeamScheduler()` splits the 64 iterations into 32 chunks (4 per thread), handed
+  out one by one, hence the higher cost; with `chunksize` or `nchunks` matched to the loop,
+  it costs about as much as the static schedule.
 - `-t 8` is the default since Julia 1.12: 8 default threads **plus one interactive thread**,
   so 9 threads share 8 cores. `Threads.@threads :static` then pays about the scheduler's
-  sleep threshold (100 µs) per loop. Its sticky tasks must wait until the OS deschedules a
-  thread that is spinning in the scheduler. `:dynamic` is not affected, and neither are the
-  team and Polyester. The worker tasks already run, and the caller (on the interactive
-  thread) runs chunk 1 while one default thread stays unused.
+  sleep threshold (100 µs) per loop: its sticky tasks wait until the OS deschedules a thread
+  spinning in the scheduler. `:dynamic`, the team and Polyester are not affected: the worker
+  tasks already run, and the caller (on the interactive thread) runs chunk 1 while one
+  default thread stays unused.
 - OhMyThreads' `:static` scheduler also uses sticky tasks and has the same problem with `-t 8`.
 - KernelAbstractions 0.10 runs `CPU` kernels through POCL (`CPU()` is a `POCLBackend()`), so
   `foreach_index` compiles the body as a kernel. A launch costs about as much as a `@threads`
-  loop, but it allocates much less.
+  loop but allocates much less.
 - With `-t 8,0` (no interactive thread) `@threads :static` costs about 2–3 µs.
-- Waking up workers that have gone to sleep costs about 10–15 µs, for the team and for
-  `@threads` alike. Raise the spin time when loops are separated by longer serial phases.
+- Waking sleeping workers costs about 10–15 µs, for the team and `@threads` alike. Raise
+  the spin time when longer serial phases separate the loops.
 
 ## Where the time goes
 
 Hardware counters per loop on the calling thread (`benchmark/overhead/counters.jl`, LinuxPerf.jl,
-same loop and machine as above, Julia 1.12, `-t 8`):
+same loop and machine, Julia 1.12, `-t 8`):
 
 | | cycles | instructions | L1d misses | last-level cache misses |
 |---|---|---|---|---|
@@ -59,11 +58,11 @@ same loop and machine as above, Julia 1.12, `-t 8`):
 
 (Ranges over three runs; the spread comes from other jobs on the machine.)
 
-The cache misses are the hand-off: every worker's command field is a cache line that moves
-between the calling thread's core and the worker's core, twice per loop (the worker's claim
+The cache misses are the hand-off: each worker's command field is a cache line that moves
+between the calling thread's core and the worker's core twice per loop (the worker's claim
 and its completion). Timestamps at the stages of a loop (8 threads, 64 iterations, median
-nanoseconds; the timers themselves add about 20 ns per stage) show where the calling
-thread's time goes:
+nanoseconds; the timers add about 20 ns per stage) show where the calling thread's time
+goes:
 
 | stage of the calling thread | ns |
 |---|---|
@@ -74,36 +73,35 @@ thread's time goes:
 | waiting for the last worker | 20–100 |
 | clearing the slot, the scope and the exceptions | 20 |
 
-A worker claims its chunk within about 20 ns of the stores and is done about 100–150 ns
-later, of which the chunk itself is about 60 ns. The rest of its time is the wake-up check
-for its two children in the binary tree and the call of the chunk closure (see `job_closure` in `src/pool.jl`).
+A worker claims its chunk within about 20 ns of the stores and finishes about 100–150 ns
+later, of which the chunk itself takes about 60 ns. The rest is the wake-up check for its
+two children in the binary tree and the call of the chunk closure (see `job_closure` in `src/pool.jl`).
 
 Five details keep the hand-off at that level:
 
-- The command stores are release stores followed by one fence rather than sequentially
+- The command stores are release stores followed by one fence, not sequentially
   consistent stores: an `xchg` per store would wait for each cache line in turn, where
   plain stores overlap in the store buffer.
 - The check for untaken chunks loads before it compare-and-swaps: a failed
-  compare-and-swap would still take the line away from the worker, which then has to take
-  it back.
+  compare-and-swap would still take the line from the worker, which then has to take it
+  back.
 - Each worker's `sleeping` flag sits on its own cache line, apart from its command. The
-  flag is written only when the worker goes to sleep or wakes up, so the two flag loads of
-  every wake-up check hit a line that stays shared between all cores, instead of the line
-  the worker is claiming its chunk on. Before this, the wake-up checks cost the calling
-  thread 70 ns and every worker 50–120 ns per loop.
-- The chunk function reaches a worker as a copy of its bytes, in a buffer next to the
-  worker's command whose lines the worker keeps loading while it waits, and the worker
-  copies it into a slot of its own. Reading it from the dispatcher's slot, which the
-  dispatcher writes in every loop, cost every worker a second cache miss after the one that
-  brings it the command (about 30–40 ns per loop with 4 threads). Large chunk functions
-  (above 256 bytes) still go through the dispatcher's slot.
+  flag is written only when the worker sleeps or wakes, so the two flag loads of every
+  wake-up check hit a line shared between all cores, not the line the worker claims its
+  chunk on. Before this, the wake-up checks cost the calling thread 70 ns and every worker
+  50–120 ns per loop.
+- The dispatcher stores the chunk function into a slot of each worker, and a waiting
+  worker keeps loading the lines of the slots it used last, so the loop body arrives with
+  the command. Reading it from the dispatcher's slot, rewritten every loop, cost every
+  worker a second cache miss after the one that brings the command (30–40 ns per loop with
+  4 threads). Chunk functions above 256 bytes still run from the dispatcher's slot.
 - The slot that hands the chunk function to the workers and the buffer for the partial
-  results are constants embedded by `@generated` functions, one per type, instead of
-  entries of an `IdDict`: the two lookups cost about 50 ns per loop.
+  results are constants embedded by `@generated` functions, one per type, not `IdDict`
+  entries: the two lookups cost about 50 ns per loop.
 
 The remaining difference to Polyester is instruction count on the calling thread
 (OhMyThreads' entry with its keyword arguments and scheduler object, the job struct,
 `mapreduce` over the first chunk): about three times Polyester's at a similar cycle count.
-The exception handlers were also reduced to one per loop on the calling thread and one for
-the lifetime of each worker; entering the caller's dynamic scope installs a handler only
-when the caller has a scope at all (a `ScopedValue` or logger in effect).
+Exception handlers were also cut to one per loop on the calling thread and one per worker
+lifetime; entering the caller's dynamic scope installs a handler only when the caller has
+a scope at all (a `ScopedValue` or logger in effect).

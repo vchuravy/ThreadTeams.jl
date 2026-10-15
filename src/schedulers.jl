@@ -2,10 +2,10 @@
 #
 # OhMyThreads' parallel functions all go through `Implementation._tmapreduce` (`tforeach`,
 # `tmap!`, `tcollect` and `@tasks` too) and `Implementation._tmap`, dispatching on the
-# scheduler. These are internal functions of OhMyThreads, hence the tight compat bound.
-# The schedulers report no chunking arguments to OhMyThreads (the default), so OhMyThreads
-# leaves the chunking to us (`nchunks`, then ChunkSplitters.jl for the index ranges): it
-# only runs an input of at most one element serially itself.
+# scheduler. Both are internal to OhMyThreads, hence the tight compat bound. The
+# schedulers report no chunking arguments to OhMyThreads (the default), so it leaves the
+# chunking to us (`nchunks`, then ChunkSplitters.jl for the index ranges) and only runs an
+# input of at most one element serially itself.
 
 using OhMyThreads.Implementation: Implementation, promise_task_local,
     check_all_have_same_indices, BoxedVariableError, append!!
@@ -30,11 +30,10 @@ const ChunksInput = Union{
     ChunkSplitters.Internals.Enumerate,
 }
 
-# OhMyThreads' check for variables captured in a `Core.Box`, but computed from the type of
-# the closure at compile time, so that it costs nothing (OhMyThreads' own
-# `throw_if_boxed_captures` allocates about 100 bytes per call). Same error and same
-# opt-out (`@allow_boxed_captures`). Like OhMyThreads, it looks into closures that the
-# closure captures.
+# OhMyThreads' check for variables captured in a `Core.Box`, computed from the closure's
+# type at compile time so it costs nothing (OhMyThreads' own `throw_if_boxed_captures`
+# allocates about 100 bytes per call). Same error, same opt-out (`@allow_boxed_captures`),
+# and like OhMyThreads it looks into closures that the closure captures.
 function boxed_fields!(out::Vector{Symbol}, @nospecialize(T), seen::Vector{Any})
     (isconcretetype(T) && !any(S -> S === T, seen)) || return out
     push!(seen, T)
@@ -92,9 +91,8 @@ function (j::MapReduceItems)(c::Int)
     r = chunk_range(j.items, c, j.n)
     if j.kwargs isa NamedTuple{(:init,)}
         # With `init` (as for `tforeach`), `mapreduce` is the left fold
-        # `op(op(init, f(item1)), f(item2))...` (`Base.mapfoldl_impl`). Written out, this
-        # keeps `mapreduce` off the critical path of every chunk; for one item per chunk
-        # (as for `chunks(...; n = nthreads())` inputs) it is `op(init, f(item))`.
+        # `op(op(init, f(item1)), f(item2))...` (`Base.mapfoldl_impl`); written out, it
+        # stays off every chunk's critical path
         op = promise_task_local(j.op)
         acc = j.kwargs.init
         for i in r
@@ -109,7 +107,7 @@ function (j::MapReduceItems)(c::Int)
 end
 
 # `f::F` and `op::Op`: without the static parameters, Julia would not specialize on the
-# closures (they are only passed on), and would box them on every call.
+# closures (they are only passed on) and would box them on every call.
 function Implementation._tmapreduce(
         f::F, op::Op, Arrs, ::Type{OutputType},
         sched::TeamSchedulers,
@@ -135,7 +133,7 @@ function Implementation._tmapreduce(
     job.n == 1 && return job(1)
     if OutputType === Nothing
         # `tforeach` (and `@tasks` without a reduction) has no results to combine: run the
-        # chunks without the partials buffer of `run_fold` and its exception handler
+        # chunks without `run_fold`'s partials buffer and exception handler
         run_chunks(job, job.n, sched)
         return nothing
     end

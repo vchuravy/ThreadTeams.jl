@@ -10,9 +10,9 @@
 Number of chunks a parallel operation over `itr` would be split into right now: with the
 [`TeamScheduler`](@ref) at most one per thread of the `:default` thread pool, with the
 [`GreedyTeamScheduler`](@ref) as many as it asks for, and at most one per element. `1`
-means that the operation runs serially, which is the case with a single thread and inside
-another parallel operation on the pool. (During precompilation, loops also run serially,
-but that is decided later.)
+means the operation runs serially: with a single thread, and inside another parallel
+operation on the pool. (Loops also run serially during precompilation, but that is
+decided later.)
 """
 @inline nchunks(itr, sched::TeamSchedulers = TeamScheduler()) =
     nchunks_for_length(plength(itr), sched)
@@ -36,16 +36,15 @@ end
 end
 
 # The linear indices of chunk `c` of `n` contiguous chunks of `A`, split with
-# ChunkSplitters.jl as OhMyThreads' schedulers do (`index_chunks` is imported in
-# schedulers.jl). The index range is chunked (rather than `A` itself) so that this also
-# works for `A`s that ChunkSplitters does not chunk, e.g. `enumerate(chunks(...))`.
-# `n == 1` is the whole collection (also when it is empty).
+# ChunkSplitters.jl like OhMyThreads' schedulers (`index_chunks` is imported in
+# schedulers.jl). Chunking the index range rather than `A` itself also covers `A`s that
+# ChunkSplitters does not chunk, e.g. `enumerate(chunks(...))`. `n == 1` is the whole
+# collection (also when empty).
 @inline function chunk_range(A, c::Int, n::Int)
     r = firstindex(A):lastindex(A)
     n == 1 && return r
-    # One element per chunk, e.g. the `chunks(...; n = nthreads())` of a `TeamScheduler`
-    # loop: skip ChunkSplitters' index arithmetic (integer divisions) on the critical path
-    # of every chunk
+    # One element per chunk (e.g. `chunks(...; n = nthreads())` on a `TeamScheduler`):
+    # skip ChunkSplitters' integer divisions on every chunk's critical path
     if n == length(r)
         i = first(r) + (c - 1)
         return i:i

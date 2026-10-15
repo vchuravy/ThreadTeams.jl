@@ -10,10 +10,9 @@ re-exports the OhMyThreads.jl API and adds two schedulers:
 - [`GreedyTeamScheduler`](@ref) (`scheduler = :greedyteam`): more chunks than
   threads, taken by the caller and the workers as they become free (load balancing).
 
-There is one sticky worker task per thread of the `:default` thread pool. After a loop,
-idle workers spin for a short while (see [`ThreadTeams.set_spin_time!`](@ref)) before
-they go to sleep, so that back-to-back loops do not pay for task creation, scheduling and
-wake-up.
+One sticky worker task runs per thread of the `:default` thread pool. After a loop, idle
+workers spin for a short while (see [`ThreadTeams.set_spin_time!`](@ref)) before they
+sleep, so back-to-back loops pay for no task creation, scheduling or wake-up.
 
 Pool controls: [`ThreadTeams.nworkers`](@ref), [`ThreadTeams.set_spin_time!`](@ref),
 [`ThreadTeams.spin_time`](@ref), [`ThreadTeams.parallel_phase`](@ref),

@@ -2,44 +2,42 @@
 
 `HandOff.tla` models one parallel region of the team (src/pool.jl: `dispatch!`,
 `wait_for_command`, `worker_loop`, `wake_children`, `wait_idle`) under a weak memory model,
-with the memory ordering of every atomic access as a parameter. `check.sh` runs TLC on one
-configuration. The model was used to review the orderings and to weaken those that are not
+with the ordering of every atomic access as a parameter. `check.sh` runs TLC on one
+configuration. The model served to review the orderings and weaken those that are not
 load-bearing.
 
 ## The model
 
-**Threads.** The dispatcher (the task that starts the region; it runs chunk 1 and steals
-unclaimed chunks) and `N` workers; worker `k` gets chunk `k + 1`. Workers start spinning or
-asleep, in every combination; a worker may decide to go to sleep whenever it has read a
-command that is not positive (the real worker does so after the spin time).
+**Threads.** The dispatcher (starts the region, runs chunk 1, steals unclaimed chunks) and
+`N` workers; worker `k` gets chunk `k + 1`. Workers start spinning or asleep, in every
+combination, and may go to sleep whenever they have read a non-positive command (the real
+worker does after the spin time).
 
-**Memory.** A view-based operational model of release/acquire consistency with
-sequentially consistent fences (the promise-free fragment of the promising semantics of
-Kang et al., 2017). Every location keeps the list of its writes; every thread keeps a view,
-the newest write of each location it knows about. A load returns any write at or after the
-thread's view, so stale values are read unless something orders the access. A release
-store attaches the writer's view to the write, an acquire load joins it into the reader's
-view. A read-modify-write reads the newest write and carries the view of that write
-(release sequences). An sc fence joins the thread's view with a global view and stores the
-result back.
+**Memory.** A view-based operational model of release/acquire consistency with sc fences
+(the promise-free fragment of the promising semantics, Kang et al. 2017). Every location
+keeps its list of writes; every thread keeps a view, the newest write of each location it
+knows. A load returns any write at or after the view, so stale values are read unless
+something orders the access. A release store attaches the writer's view to the write, an
+acquire load joins it into the reader's view, a read-modify-write reads the newest write
+and carries its view (release sequences), and an sc fence joins the thread's view with a
+global one and stores the result back.
 
 Sequentially consistent *accesses* lie between two encodings (constant `SCENC`):
 
 - `fence`: sc store = release store + sc fence; sc load = acquire load; sc RMW = fence +
-  acq_rel RMW + fence. This is how x86 implements them (`xchg`, `mov`, `lock cmpxchg`). It is
-  a correct implementation of C11/Julia sc accesses, so it has at most their behaviours.
-- `weak`: sc accesses are plain release/acquire accesses: more behaviours than C11, since
-  sc accesses are at least that strong.
+  acq_rel RMW + fence. How x86 implements them (`xchg`, `mov`, `lock cmpxchg`); a correct
+  implementation of C11/Julia sc accesses, so it has at most their behaviours.
+- `weak`: sc accesses are plain release/acquire accesses: more behaviours than C11.
 
 A property that holds under `weak` holds under C11 on any hardware; one that fails under
 `fence` fails on x86. The explicit `Threads.atomic_fence()` is an sc fence in both.
 
-**Abstractions.** The region data (the closure `ws.job`, the bytes of the chunk function,
-the scope; the number of chunks and the skipped worker travel in the command word itself)
-is one location written before the commands; a worker's results (`errs[k]`, the partials buffer)
-are one location written before its final `cmd = 0`. The worker's `Event` is a flag that
-carries the notifier's view (its lock is a release/acquire pair). Loops that re-read a
-location get a fairness assumption: a store becomes visible eventually.
+**Abstractions.** The region data (the closure `ws.job`, the workers' slots, the scope; the
+number of chunks and the skipped worker travel in the command word) is one location written
+before the commands; a worker's results (`errs[k]`, the partials buffer) are one location
+written before its final `cmd = 0`. The worker's `Event` is a flag that carries the
+notifier's view (its lock is a release/acquire pair). Loops that re-read a location get a
+fairness assumption: a store becomes visible eventually.
 
 **Properties.**
 
@@ -55,16 +53,15 @@ location get a fairness assumption: a store becomes visible eventually.
 ## Results
 
 `N = 1`: the dispatcher hands the chunk to the worker and wakes it. `N = 2` with
-`TREE = "chain"`: worker 1 wakes worker 2, the case of the binary wake-up tree in which a
-worker wakes another one (`chain` needs two workers for that instead of three; the binary
-tree with two workers is the `N = 1` case twice). Only the woken worker sleeps
-(`SLEEPERS`), at most once (`MAXSLEEP`), which keeps the state space at 10^3 to 10^5
-states; the full model with two sleeping workers has 10^8.
+`TREE = "chain"`: worker 1 wakes worker 2, the case of the binary tree in which a worker
+wakes another (`chain` needs two workers for that instead of three; the binary tree with
+two workers is the `N = 1` case twice). Only the woken worker sleeps (`SLEEPERS`), at most
+once (`MAXSLEEP`): 10^3 to 10^5 states, against 10^8 with two sleeping workers.
 
-"current" is the orderings of the code before this review, "weakened" the ones it has
-now: relaxed loads in the worker's spin loop and in the dispatcher's steal loop, a relaxed
-steal compare-and-swap and failure ordering of the claim, a relaxed `sleeping = false`
-and a relaxed re-notify load in `wait_idle`.
+"current" is the orderings before this review, "weakened" the ones the code has now:
+relaxed loads in the worker's spin loop and the dispatcher's steal loop, a relaxed steal
+compare-and-swap and claim failure ordering, a relaxed `sleeping = false` and re-notify
+load in `wait_idle`.
 
 | configuration | N = 1 | N = 2, chain |
 |---|---|---|
@@ -81,17 +78,16 @@ and a relaxed re-notify load in `wait_idle`.
 | the load of `cmd` after `sleeping = true` relaxed | all hold (x86: the fence after the store orders it) | all hold |
 | the loads of `wake_chunk` relaxed | all hold (x86) | all hold (x86) |
 
-`Terminates` holds in every configuration, including those with lost wake-ups: the
-dispatcher runs every chunk that its worker has not claimed, so a worker that sleeps
-through its command only makes the region slower.
+`Terminates` holds in every configuration, lost wake-ups included: the dispatcher runs
+every chunk its worker has not claimed, so a worker that sleeps through its command only
+slows the region.
 
-The last two rows hold under the x86 encoding but cannot be certified for C11 by this
-model: C11's rules for sc accesses are stronger than `weak` and weaker than `fence`. By the
-C11 rules, a relaxed load after an sc fence sees the last sc store before the fence (so the
-dispatcher's wake loads could be relaxed), but a worker waking a child has no fence, only
-its sc claim, and there a lost wake-up is allowed by C11 even with sc loads. The code keeps
-these accesses sequentially consistent, which costs nothing on x86 (every load is a plain
-`mov`) and one `ldar` instead of `ldr` on AArch64, where the hardware's RCsc ordering of
+The last two rows hold under the x86 encoding but this model cannot certify them for C11,
+whose sc rules lie between `weak` and `fence`. Under C11 a relaxed load after an sc fence
+sees the last sc store before the fence (so the dispatcher's wake loads could be relaxed),
+but a worker waking a child has no fence, only its sc claim, and there C11 allows a lost
+wake-up even with sc loads. The code keeps these accesses sc: free on x86 (every load is a
+plain `mov`), one `ldar` instead of `ldr` on AArch64, where the RCsc ordering of
 `stlr`/`ldar` and `casal` makes the handshake work in practice.
 
 ## The orderings of src/pool.jl
@@ -115,10 +111,10 @@ these accesses sequentially consistent, which costs nothing on x86 (every load i
 | `POOL.pool` | acquire / release | publishes the new pool |
 | `counter.next` (greedy) | monotonic | only claims indices; results go through `cmd = 0` |
 
-On x86 every load is a plain `mov` whatever its ordering, release and monotonic stores
-are plain stores, an sc store is an `xchg`, and a compare-and-swap is a `lock cmpxchg`
-whatever its ordering. The weakening therefore changes no instruction on x86; on AArch64
-it turns `ldar` into `ldr` in the two spin loops and `casal` into `cas` in the steal loop.
+On x86 every load is a plain `mov` and every compare-and-swap a `lock cmpxchg` whatever
+the ordering, release and monotonic stores are plain stores, an sc store is an `xchg`: the
+weakening changes no instruction there. On AArch64 it turns `ldar` into `ldr` in the two
+spin loops and `casal` into `cas` in the steal loop.
 
 ## Running
 

@@ -3,25 +3,25 @@
 # Enzyme can not differentiate the team itself (atomics, long-lived tasks), so
 # `run_chunks(f, n, sched)` and `run_fold(f, op, n, sched)` (`tforeach`, `tmapreduce`,
 # `treduce`, `tmap!`, `@tasks` with a team scheduler) have rules that differentiate the
-# chunk function `f(c)` and run the derivative chunks on the team as well, with the same
-# scheduler. `tmap` and `tcollect` are not supported: their chunk results are vectors, and
-# the reduction rule needs a number (or tuple of numbers) as the result; they throw.
+# chunk function `f(c)` and run the derivative chunks on the team, with the same scheduler.
+# `tmap` and `tcollect` throw: their chunk results are vectors, and the reduction rule
+# needs a number (or tuple of numbers) as the result.
 #
 # - forward mode: chunk `c` runs `autodiff(Forward, ...)` of `f(c)`;
-# - reverse mode: the augmented primal runs the augmented forward pass of every chunk in
-#   parallel and keeps one tape per chunk; the reverse pass runs the reverse pass of every
-#   chunk in parallel.
+# - reverse mode: the augmented primal runs every chunk's augmented forward pass in
+#   parallel and keeps one tape per chunk; the reverse pass runs the chunks' reverse
+#   passes in parallel.
 #
 # This is how Enzyme.jl differentiates `Threads.@threads`. Chunks that read the same memory
-# add their adjoints to the same shadow concurrently; Enzyme makes these updates atomic when
-# Julia runs with more than one thread. The derivative chunks call the chunk function
-# through a reference (`call_chunk(r, c)`), so that the adjoints of values it captures by
-# value (a scalar coefficient: the closure arrives as `MixedDuplicated`, or as `Active` if
-# it captures nothing else) accumulate in its shadow reference.
+# add their adjoints to the same shadow concurrently; Enzyme makes these updates atomic
+# when Julia has more than one thread. The derivative chunks call the chunk function
+# through a reference (`call_chunk(r, c)`), so the adjoints of values it captures by value
+# (a scalar coefficient: the closure arrives as `MixedDuplicated`, or as `Active` if it
+# captures nothing else) accumulate in its shadow reference.
 module ThreadTeamsEnzymeCoreExt
 
 using ThreadTeams: ThreadTeams, TeamSchedulers, run_chunks, run_fold
-# EnzymeCore defines the functions and types; Enzyme adds the methods when it is loaded
+# EnzymeCore defines the functions and types; Enzyme adds the methods when loaded
 using EnzymeCore: EnzymeCore, EnzymeRules, Annotation, Const, Active, Duplicated,
     MixedDuplicated, BatchDuplicated, BatchMixedDuplicated, Forward,
     ForwardWithPrimal, ReverseSplitWithPrimal, ReverseSplitModified,
@@ -36,8 +36,8 @@ using EnzymeCore.EnzymeRules: FwdConfig, RevConfig, AugmentedReturn
 end
 
 # The chunk function as a reference, for `call_chunk`. A `MixedDuplicated` closure (active
-# references and active or constant numbers) already comes with its shadow in a `Ref`; an
-# `Active` closure (only numbers) gets a zero shadow, returned as its adjoint afterwards.
+# references and active or constant numbers) comes with its shadow in a `Ref`; an `Active`
+# closure (only numbers) gets a zero shadow, returned as its adjoint afterwards.
 as_ref(f::Const) = Const(Ref(f.val))
 as_ref(f::Duplicated) = Duplicated(Ref(f.val), Ref(f.dval))
 as_ref(f::MixedDuplicated) = Duplicated(Ref(f.val), f.dval)
@@ -50,8 +50,8 @@ adjoint(f::Active, r::Duplicated) = r.dval[]
 adjoint(f, r) = nothing
 
 # Enzyme passes the reverse rule a different shadow `Ref` for a `MixedDuplicated` argument
-# than it passed the augmented primal, and reads that one afterwards. The reverse passes of
-# the chunks must accumulate into it, so the reference from the tape is re-bound to it.
+# than the augmented primal got, and reads that one afterwards. The chunks' reverse passes
+# must accumulate into it, so the reference from the tape is re-bound to it.
 rebind(f::MixedDuplicated, r::Duplicated) = Duplicated(r.val, f.dval)
 rebind(f::BatchMixedDuplicated, r::BatchDuplicated) = BatchDuplicated(r.val, f.dval)
 rebind(f, r) = r
@@ -145,9 +145,9 @@ end
 
 #
 # run_fold(f, op, n, sched): chunk `c` stores `f(c)` into a buffer of partial results,
-# which are combined in chunk order. Chunk results of type `Nothing` (`tforeach`, `tmap!`)
-# are handled like `run_chunks`, in every mode. Other results are supported for a constant
-# `op`, width 1, and a constant or `Active` result (numbers, tuples of numbers).
+# combined in chunk order. Chunk results of type `Nothing` (`tforeach`, `tmap!`) are
+# handled like `run_chunks`, in every mode. Other results need a constant `op`, width 1,
+# and a constant or `Active` result (numbers, tuples of numbers).
 #
 
 # One chunk of a reduction: store the partial result
