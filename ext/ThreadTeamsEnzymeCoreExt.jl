@@ -244,22 +244,17 @@ function EnzymeRules.augmented_primal(
             @inbounds dbuf[c] = make_zero(buf[c])
         end
     end
-    if RT <: Active && dbuf !== nothing
-        # The forward pass of the combine, with its tape: `op` may read memory that changes
-        # before the reverse pass
-        mode = set_runtime_activity(ReverseSplitWithPrimal, config)
-        fwd_c, rev_c = autodiff_thunk(
-            mode, Const{typeof(fold_all)}, RT, Core.Typeof(op), Duplicated{typeof(buf)}
-        )
-        tape_c, acc, _ = fwd_c(Const(fold_all), op, Duplicated(buf, dbuf))
-        combine = (rev_c, tape_c)
-    else
-        acc = EnzymeRules.needs_primal(config) ? fold_all(op.val, buf) : nothing
-        combine = nothing
-    end
+    # The forward pass of the combine, with its tape: `op` may read memory that changes
+    # before the reverse pass, which then only runs the combine's reverse pass
+    bufs = dbuf === nothing ? Const(buf) : Duplicated(buf, dbuf)
+    mode = set_runtime_activity(ReverseSplitWithPrimal, config)
+    fwd_c, rev_c = autodiff_thunk(
+        mode, Const{typeof(fold_all)}, RT, Core.Typeof(op), Core.Typeof(bufs)
+    )
+    tape_c, acc, _ = fwd_c(Const(fold_all), op, bufs)
     return AugmentedReturn(
         EnzymeRules.needs_primal(config) ? acc : nothing, nothing,
-        (store, buf, dbuf, rev, tapes, combine)
+        (store, buf, dbuf, rev, tapes, (rev_c, bufs, tape_c))
     )
 end
 
@@ -279,10 +274,12 @@ function EnzymeRules.reverse(
         # the partials store's shadow holds the chunk function's shadow reference
         store.dval[] = StorePartial(f.dval, dbuf)
     end
-    if dret isa Active && combine !== nothing
-        # adjoints of the partial results, seeded with the adjoint of the result
-        rev_c, tape_c = combine
-        rev_c(Const(fold_all), op, Duplicated(buf, dbuf), dret.val, tape_c)
+    # adjoints of the partial results, seeded with the adjoint of the result
+    rev_c, bufs, tape_c = combine
+    if dret isa Active
+        rev_c(Const(fold_all), op, bufs, dret.val, tape_c)
+    else
+        rev_c(Const(fold_all), op, bufs, tape_c)
     end
     # adjoints of the chunks (also of what they wrote into shadow memory, with a constant
     # result)

@@ -83,6 +83,10 @@ end
         y = collect(range(0.5, 1.5; length = 13))
         @test Enzyme.gradient(Reverse, ad_stateful_op, y)[1] ≈
             2 .* (2.0^12 * prod(abs2, y)) ./ y
+        # a constant result
+        dx = zero(x)
+        autodiff(Reverse, ad_tmapreduce, Const, Duplicated(x, dx))
+        @test iszero(dx)
     end
     @testset "forward" begin
         dx = ones(length(x))
