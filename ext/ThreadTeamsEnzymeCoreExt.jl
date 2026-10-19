@@ -25,9 +25,8 @@ using ThreadTeams: ThreadTeams, TeamSchedulers, run_chunks, run_fold
 using EnzymeCore: EnzymeCore, EnzymeRules, Annotation, Const, Active, Duplicated,
     MixedDuplicated, BatchDuplicated, BatchMixedDuplicated, Forward,
     ForwardWithPrimal, ReverseSplitWithPrimal, ReverseSplitModified,
-    ReverseSplitWidth, autodiff, autodiff_thunk, make_zero,
-    set_runtime_activity, set_strong_zero
-using EnzymeCore.EnzymeRules: FwdConfig, RevConfig, AugmentedReturn
+    ReverseSplitWidth, autodiff, autodiff_thunk, make_zero
+using EnzymeCore.EnzymeRules: FwdConfig, RevConfig, AugmentedReturn, set_config
 
 # One chunk of the loop
 @inline function call_chunk(r::Base.RefValue{F}, c::Int) where {F}
@@ -56,18 +55,14 @@ rebind(f::MixedDuplicated, r::Duplicated) = Duplicated(r.val, f.dval)
 rebind(f::BatchMixedDuplicated, r::BatchDuplicated) = BatchDuplicated(r.val, f.dval)
 rebind(f, r) = r
 
-function forward_mode(config::FwdConfig)
-    mode = set_runtime_activity(Forward, config)
-    return set_strong_zero(mode, config)
-end
+forward_mode(config::FwdConfig) = set_config(Forward, config)
 
 # Reverse split mode for `call_chunk(r, c)`. Whatever the loop function captures may be
 # overwritten between the forward and the reverse pass if the rule's argument may be.
 function reverse_mode(config::RevConfig, overwritten::Bool, width::Int = EnzymeRules.width(config))
     mode = ReverseSplitModified(ReverseSplitWithPrimal, Val((false, overwritten, false)))
     mode = ReverseSplitWidth(mode, Val(width))
-    mode = set_runtime_activity(mode, config)
-    return set_strong_zero(mode, config)
+    return set_config(mode, config)
 end
 
 #
@@ -211,7 +206,7 @@ function EnzymeRules.forward(
             dacc = make_zero(acc)
         else
             dacc, acc = autodiff(
-                set_runtime_activity(ForwardWithPrimal, config),
+                set_config(ForwardWithPrimal, config),
                 Const(fold_all), op, Duplicated(buf, dbuf)
             )
         end
@@ -247,7 +242,7 @@ function EnzymeRules.augmented_primal(
     # The forward pass of the combine, with its tape: `op` may read memory that changes
     # before the reverse pass, which then only runs the combine's reverse pass
     bufs = dbuf === nothing ? Const(buf) : Duplicated(buf, dbuf)
-    mode = set_runtime_activity(ReverseSplitWithPrimal, config)
+    mode = set_config(ReverseSplitWithPrimal, config)
     fwd_c, rev_c = autodiff_thunk(
         mode, Const{typeof(fold_all)}, RT, Core.Typeof(op), Core.Typeof(bufs)
     )
