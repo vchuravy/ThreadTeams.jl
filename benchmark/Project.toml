@@ -13,4 +13,4 @@ ThreadTeams = {path = ".."}
 BenchmarkTools = "1"
 Enzyme = "0.13.216"
 FastBroadcast = "1.4"
-FixedSizeArrays = "1"
+FixedSizeArrays = "1.4"

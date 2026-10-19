@@ -6,6 +6,7 @@
 using ThreadTeams
 using LinuxPerf
 using Printf
+include("../aligned.jl")
 
 const HAVE_POLYESTER = Base.find_package("Polyester") !== nothing
 HAVE_POLYESTER && @eval using Polyester
@@ -61,7 +62,7 @@ function report(name, f, x, n; threads)
     return println()
 end
 
-x = zeros(N)
+x = aligned(zeros(N))   # cache-line aligned, as in overhead.jl
 println(
     "Julia ", VERSION, ", threads ", Threads.nthreads(:default), ",",
     Threads.nthreads(:interactive), ", ", N, " iterations; counts per loop"

@@ -9,6 +9,7 @@ using ThreadTeams
 using Enzyme
 using FastBroadcast
 using FixedSizeArrays: FixedSizeArray
+include("aligned.jl")   # `aligned`: copies of the arrays at cache-line-aligned addresses
 
 const SUITE = BenchmarkGroup()
 
@@ -47,7 +48,7 @@ for (name, f) in (
         ("Threads.@threads :dynamic", f_threads_dynamic),
         ("OhMyThreads tforeach", f_omt_dynamic), ("serial loop", f_serial),
     )
-    SUITE["overhead"][name] = @benchmarkable $f(x) setup = (x = zeros(N)) samples = 10_000 evals = 1 seconds = 3
+    SUITE["overhead"][name] = @benchmarkable $f(x) setup = (x = aligned(zeros(N))) samples = 10_000 evals = 1 seconds = 3
 end
 
 # Loops with more work per iteration, where the hand-off is a smaller part
@@ -64,8 +65,8 @@ function f_work_serial(x)
     return
 end
 for n in (1_000, 100_000)
-    SUITE["work"]["tforeach team, $n"] = @benchmarkable f_work_team(x) setup = (x = zeros($n)) samples = 2_000 evals = 1 seconds = 3
-    SUITE["work"]["serial, $n"] = @benchmarkable f_work_serial(x) setup = (x = zeros($n)) samples = 2_000 evals = 1 seconds = 3
+    SUITE["work"]["tforeach team, $n"] = @benchmarkable f_work_team(x) setup = (x = aligned(zeros($n))) samples = 2_000 evals = 1 seconds = 3
+    SUITE["work"]["serial, $n"] = @benchmarkable f_work_serial(x) setup = (x = aligned(zeros($n))) samples = 2_000 evals = 1 seconds = 3
 end
 
 # Automatic differentiation with Enzyme: the loop on the team (through the rules of the
@@ -97,9 +98,9 @@ fb_log_thread!(dst, src) = (@.. thread = true dst = log(src); nothing)
 fb_log_serial!(dst, src) = (@.. thread = false dst = log(src); nothing)
 fb_log_base!(dst, src) = (dst .= log.(src); nothing)
 for n in (1_000, 100_000)
-    SUITE["fastbroadcast"]["log thread, $n"] = @benchmarkable fb_log_thread!(dst, src) setup = (src = rand($n); dst = similar(src)) samples = 2_000 evals = 1 seconds = 3
-    SUITE["fastbroadcast"]["log serial, $n"] = @benchmarkable fb_log_serial!(dst, src) setup = (src = rand($n); dst = similar(src)) samples = 2_000 evals = 1 seconds = 3
-    SUITE["fastbroadcast"]["log Base, $n"] = @benchmarkable fb_log_base!(dst, src) setup = (src = rand($n); dst = similar(src)) samples = 2_000 evals = 1 seconds = 3
+    SUITE["fastbroadcast"]["log thread, $n"] = @benchmarkable fb_log_thread!(dst, src) setup = (src = aligned(rand($n)); dst = aligned(similar(src))) samples = 2_000 evals = 1 seconds = 3
+    SUITE["fastbroadcast"]["log serial, $n"] = @benchmarkable fb_log_serial!(dst, src) setup = (src = aligned(rand($n)); dst = aligned(similar(src))) samples = 2_000 evals = 1 seconds = 3
+    SUITE["fastbroadcast"]["log Base, $n"] = @benchmarkable fb_log_base!(dst, src) setup = (src = aligned(rand($n)); dst = aligned(similar(src))) samples = 2_000 evals = 1 seconds = 3
 end
 # Many arguments over a 3-dimensional array (the example of FastBroadcast's README)
 function fb_axpy9_thread!(a, b, c, d, e, f, g, h, i)
@@ -110,8 +111,8 @@ function fb_axpy9_serial!(a, b, c, d, e, f, g, h, i)
     @.. thread = false a = b + 0.1 * (0.2c + 0.3d + 0.4e + 0.5f + 0.6g + 0.6h + 0.6i)
     return
 end
-SUITE["fastbroadcast"]["9 arguments thread, 100x100x8"] = @benchmarkable fb_axpy9_thread!(xs...) setup = (xs = [rand(100, 100, 8) for _ in 1:9]) samples = 2_000 evals = 1 seconds = 3
-SUITE["fastbroadcast"]["9 arguments serial, 100x100x8"] = @benchmarkable fb_axpy9_serial!(xs...) setup = (xs = [rand(100, 100, 8) for _ in 1:9]) samples = 2_000 evals = 1 seconds = 3
+SUITE["fastbroadcast"]["9 arguments thread, 100x100x8"] = @benchmarkable fb_axpy9_thread!(xs...) setup = (xs = [aligned(rand(100, 100, 8)) for _ in 1:9]) samples = 2_000 evals = 1 seconds = 3
+SUITE["fastbroadcast"]["9 arguments serial, 100x100x8"] = @benchmarkable fb_axpy9_serial!(xs...) setup = (xs = [aligned(rand(100, 100, 8)) for _ in 1:9]) samples = 2_000 evals = 1 seconds = 3
 
 # Downstream: the loop with which Trixi.jl resets the time derivative (`set_zero!`, timer
 # "reset ∂u/∂t") in every evaluation of the right-hand side, on its `:pool` threading
@@ -149,7 +150,7 @@ function ten_in_a_row(f::F, du) where {F}
     end
     return
 end
-trixi_du() = FixedSizeArray(zeros(1, 4, 4, 256))
+trixi_du() = aligned(FixedSizeArray, zeros(1, 4, 4, 256))
 SUITE["trixi"]["reset du team"] = @benchmarkable trixi_reset_team!(du) setup = (du = trixi_du()) samples = 10_000 evals = 1 seconds = 3
 SUITE["trixi"]["reset du team, 10 in a row"] = @benchmarkable ten_in_a_row(trixi_reset_team!, du) setup = (du = trixi_du()) samples = 10_000 evals = 1 seconds = 3
 SUITE["trixi"]["reset du Threads.@threads :static"] = @benchmarkable trixi_reset_static!(du) setup = (du = trixi_du()) samples = 10_000 evals = 1 seconds = 3

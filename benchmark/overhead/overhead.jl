@@ -18,7 +18,8 @@ using BenchmarkTools
 using Printf
 using OhMyThreads: OhMyThreads   # ThreadTeams re-exports its API
 using KernelAbstractions: KernelAbstractions, CPU
-using FixedSizeArrays: FixedSizeVector
+using FixedSizeArrays: FixedSizeArray
+include("../aligned.jl")
 
 const HAVE_POLYESTER = Base.find_package("Polyester") !== nothing
 HAVE_POLYESTER && @eval using Polyester
@@ -87,9 +88,10 @@ fs_fixed = Any[
 ]
 HAVE_POLYESTER && insert!(fs_fixed, 3, ("Polyester @batch, FSV", f_batch))
 
-x = zeros(N)
-xf = FixedSizeVector{Float64}(undef, N)
-fill!(xf, 0.0)
+# At a cache-line-aligned address: otherwise whether neighbouring chunks share cache lines,
+# and with it the time per loop, depends on where the process happens to allocate `x`
+x = aligned(zeros(N))
+xf = aligned(FixedSizeArray, zeros(N))
 println(
     "Julia ", VERSION, ", threads ", Threads.nthreads(:default), ",",
     Threads.nthreads(:interactive), ", ", N, " iterations"
