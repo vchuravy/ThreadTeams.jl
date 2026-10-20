@@ -253,7 +253,7 @@ mutable struct Pool
     const workers::Vector{WorkerState}
     const events::Vector{Base.Event}
     const tasks::Vector{Task}
-    # `errs[k]`: `CapturedException` thrown by the chunk worker `k` ran, or `nothing`
+    # `errs[k]`: `ChunkFailedException` of the chunk worker `k` ran, or `nothing`
     const errs::Vector{Any}
     # `tid2worker[tid]`: index of the worker running on thread `tid`, or `0`
     const tid2worker::Vector{Int}
@@ -542,7 +542,7 @@ end
         # thread): then a command that arrived meanwhile, or `STOP`, is still to be read
         if (@atomic :monotonic ws.cmd) == RUNNING
             # (The dispatcher clears this worker's slot, see `dispatch!`)
-            pool.errs[k] = CapturedException(err, catch_backtrace())
+            pool.errs[k] = ChunkFailedException(err, catch_backtrace())
             @atomic :release ws.cmd = 0
         end
     end
@@ -895,7 +895,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         for chunk in 2:n
             k = worker_for_chunk(chunk, skip)
             err = @inbounds pool.errs[k]
-            err === nothing || throw_worker_error(err::CapturedException)
+            err === nothing || throw_worker_error(err::ChunkFailedException)
         end
     finally
         # Thrown outside the chunks, e.g. an interrupt while waiting for the workers:
@@ -951,7 +951,7 @@ end
             try
                 run_chunk(slot, chunk)
             catch err
-                @inbounds pool.errs[k] = CapturedException(err, catch_backtrace())
+                @inbounds pool.errs[k] = ChunkFailedException(err, catch_backtrace())
             end
         end
     end
@@ -1032,13 +1032,40 @@ end
     return nothing
 end
 
-# Rethrow the original exception of a worker chunk; the worker's backtrace stays on the
-# exception stack (`current_exceptions()`) as "caused by: ..."
-@noinline function throw_worker_error(err::CapturedException)
+"""
+    ThreadTeams.ChunkFailedException
+
+The exception of a chunk that did not run on the calling task: `exception`, and the raw
+`backtrace` of the task that ran it. Like `TaskFailedException`, it keeps the raw backtrace
+and only looks up its stack frames when it is shown (`CapturedException` looks them up
+when it is created: milliseconds on Julia 1.10 and 1.11).
+
+A loop rethrows the chunk's original exception; the `ChunkFailedException` is on the
+exception stack below it (`current_exceptions()`), shown as "caused by: ...".
+"""
+struct ChunkFailedException <: Exception
+    exception::Any
+    backtrace::Any
+end
+
+function Base.showerror(io::IO, ex::ChunkFailedException, bt = nothing; backtrace = true)
+    print(io, "ChunkFailedException")
+    bt !== nothing && backtrace && Base.show_backtrace(io, bt)
+    println(io)
+    printstyled(io, "\n    nested chunk error: "; color = Base.error_color())
+    b = IOBuffer()
+    showerror(IOContext(b, io), ex.exception, ex.backtrace; backtrace)
+    print(io, replace(String(take!(b)), "\n" => "\n    "))
+    return nothing
+end
+
+# Rethrow the original exception of a chunk; the backtrace of the task that ran it stays
+# on the exception stack (`current_exceptions()`) as "caused by: ..."
+@noinline function throw_worker_error(err::ChunkFailedException)
     return try
         throw(err)
     catch
-        throw(err.ex)
+        throw(err.exception)
     end
 end
 
@@ -1066,7 +1093,7 @@ end
             f(1)
             nothing
         catch err
-            CapturedException(err, catch_backtrace())
+            ChunkFailedException(err, catch_backtrace())
         end
     end
     for t in tasks
@@ -1074,7 +1101,7 @@ end
     end
     err1 === nothing || throw_worker_error(err1)
     for t in tasks
-        istaskfailed(t) && throw_worker_error(CapturedException(t.result, t.backtrace))
+        istaskfailed(t) && throw_worker_error(ChunkFailedException(t.result, t.backtrace))
     end
     return nothing
 end
@@ -1101,7 +1128,7 @@ function (g::GreedyJob)(p::Int)
             g.f(chunk)
         end
     catch err
-        @inbounds g.errs[p] = CapturedException(err, catch_backtrace())
+        @inbounds g.errs[p] = ChunkFailedException(err, catch_backtrace())
         @inbounds g.errchunks[p] = chunk
         @atomic :monotonic g.counter.next = typemax(Int) >> 1
     end
@@ -1117,7 +1144,7 @@ end
             first = k
         end
     end
-    first == 0 || throw_worker_error(@inbounds(errs[first])::CapturedException)
+    first == 0 || throw_worker_error(@inbounds(errs[first])::ChunkFailedException)
     return nothing
 end
 

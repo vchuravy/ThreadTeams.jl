@@ -22,4 +22,5 @@ ThreadTeams.set_spin_time!
 ThreadTeams.spin_time
 ThreadTeams.parallel_phase
 ThreadTeams.shutdown!
+ThreadTeams.ChunkFailedException
 ```

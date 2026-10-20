@@ -46,7 +46,15 @@
         catch
             current_exceptions()
         end
-        @test any(e -> e.exception isa CapturedException, excs)
+        i = findfirst(e -> e.exception isa ThreadTeams.ChunkFailedException, excs)
+        @test i !== nothing
+        cause = excs[i].exception
+        @test cause.exception == ErrorException("last")
+        # the raw backtrace is kept, and only looked up when shown
+        @test !(cause.backtrace isa Vector{Base.StackTraces.StackFrame})
+        shown = sprint(showerror, cause)
+        @test occursin("nested chunk error: last", shown)
+        @test occursin("exceptions.jl", shown)
     end
 end
 

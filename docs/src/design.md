@@ -44,7 +44,8 @@ How a parallel operation runs on the team, and what that means for the code insi
   chunks run to completion, and if chunk 1 throws, chunks no worker has started are
   skipped. Everything a serial loop would have done before the error is done. The workers
   stay usable. A worker's backtrace stays on the exception stack (`current_exceptions()`,
-  "caused by").
+  "caused by"), in a [`ThreadTeams.ChunkFailedException`](@ref) that keeps it raw until it
+  is shown.
 - **Lazy start, shutdown.** The workers start with the first parallel loop.
   `ThreadTeams.shutdown!()` stops them; the next loop starts them again.
 - **Waking up.** Sleeping workers are woken in a binary tree: whoever takes chunk `c` wakes
