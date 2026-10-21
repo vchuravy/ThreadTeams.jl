@@ -288,17 +288,6 @@ mutable struct SleepFlag
 end
 SleepFlag() = SleepFlag(pad_before(), false, pad_after())
 
-# Set when a chunk of the region stored its exception into `errs` (by the worker before
-# its release store of `cmd = 0`, by the dispatcher for a chunk it stole), so that after a
-# region the dispatcher checks one line instead of every worker's `errs`; reset with
-# `errs` by the dispatcher. `errs` is therefore all `nothing` when a region starts.
-mutable struct ErrorFlag
-    const _pad0::PadBefore
-    @atomic set::Bool
-    const _pad1::PadAfter
-end
-ErrorFlag() = ErrorFlag(pad_before(), false, pad_after())
-
 mutable struct Pool
     # Region data that does not travel with the commands (`cmd_base`): the dispatcher's
     # dynamic scope, `nothing` when the caller has none. Written only when it changes, so
@@ -307,10 +296,16 @@ mutable struct Pool
     const workers::Vector{WorkerState}
     const events::Vector{Base.Event}
     const tasks::Vector{Task}
-    # `errs[k]`: `ChunkFailedException` of the chunk worker `k` ran, or `nothing`;
-    # `failed` tells whether any is set
+    # `errs[k]`: `ChunkFailedException` of the chunk worker `k` ran, or `nothing`
     const errs::Vector{Any}
-    const failed::ErrorFlag
+    # Set when a chunk of the region stored its exception into `errs` (by the worker
+    # before its release store of `cmd = 0`, by the dispatcher for a chunk it stole), so
+    # that after a region the dispatcher checks one line instead of every worker's `errs`;
+    # reset with `errs` by the dispatcher. `errs` is therefore all `nothing` when a region
+    # starts. On a cache line of its own (see `PadBefore`).
+    const _pad0::PadBefore
+    @atomic failed::Bool
+    const _pad1::PadAfter
     # `tid2worker[tid]`: index of the worker running on thread `tid`, or `0`
     const tid2worker::Vector{Int}
     const sleepflags::Vector{SleepFlag}
@@ -600,7 +595,7 @@ end
         if (@atomic :monotonic ws.cmd) == RUNNING
             # (The dispatcher clears this worker's slot, see `dispatch!`)
             pool.errs[k] = ChunkFailedException(err, catch_backtrace())
-            @atomic :monotonic pool.failed.set = true
+            @atomic :monotonic pool.failed = true
             @atomic :release ws.cmd = 0
         end
     end
@@ -617,7 +612,8 @@ function Pool()
     nw <= CMD_MASK || error("ThreadTeams supports at most $CMD_MASK threads")
     pool = Pool(
         nothing, [WorkerState() for _ in 1:nw],
-        [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw], ErrorFlag(),
+        [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw],
+        pad_before(), false, pad_after(),
         tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
         Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed(), 0
     )
@@ -955,7 +951,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         wait_workers(pool, 2, n, skip, wslots, clears)
         drained = cleared = true
         # Relaxed: ordered by the acquire loads of the workers' `cmd = 0` (`wait_workers`)
-        (@atomic :monotonic pool.failed.set) && throw_first_error(pool, n, skip)
+        (@atomic :monotonic pool.failed) && throw_first_error(pool, n, skip)
     finally
         # Thrown outside the chunks, e.g. an interrupt while waiting for the workers:
         # running chunks use the region's slots, buffers and greedy counter, which the next
@@ -967,7 +963,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         has_scope && (@atomic :monotonic pool.scope = nothing)
         # After a region that ended normally there is nothing left to clean up: the
         # workers' slots are empty, no chunk failed
-        (cleared && !(@atomic :monotonic pool.failed.set)) ||
+        (cleared && !(@atomic :monotonic pool.failed)) ||
             clean_up_region(pool, n, skip, wslots, copies, clears, cleared)
     end
     return nothing
@@ -999,7 +995,7 @@ end
             @inbounds pool.errs[k] = nothing
         end
     end
-    @atomic :monotonic pool.failed.set = false
+    @atomic :monotonic pool.failed = false
     return nothing
 end
 
@@ -1035,7 +1031,7 @@ end
                 run_chunk(slot, chunk)
             catch err
                 @inbounds pool.errs[k] = ChunkFailedException(err, catch_backtrace())
-                @atomic :monotonic pool.failed.set = true
+                @atomic :monotonic pool.failed = true
             end
         end
     end
