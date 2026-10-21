@@ -8,15 +8,15 @@
 #
 # A parallel region is started by `dispatch!`:
 #
-# 1. The chunk function `f::F` is stored into pre-allocated per-type `Slot{F}`s (one
-#    element of a `Memory{F}` each, emptied after the region with `unsetindex!`): the
-#    caller's, and one per worker unless `f` is large (`COPY_BYTES`). No boxing of `f`.
-#    Workers run it through a closure per type `F`, created in the caller's world age
-#    (`job_closure`), which finds the worker's slot from the worker's index.
-# 2. The caller publishes its dynamic scope (if any), then stores the closure and the
-#    command (chunk index, number of chunks, see `cmd_base`) into the `WorkerState` of the
-#    workers of chunks `2:n` (release stores, then one fence), in decreasing chunk order.
-#    The worker on the caller's thread (if any) is skipped.
+# 1. The chunk function `f::F` is stored into a pre-allocated per-type `Slot{F}` (one
+#    element of a `Memory{F}`, emptied after the region with `unsetindex!`). No boxing of
+#    `f`. Workers reach it through the `Job` of type `F` (`get_job`): a C function pointer
+#    to `job_op`, the only worker code specialized on `F`. A worker copies a small `f`
+#    (`COPY_BYTES`) into a slot of its own before running its chunk.
+# 2. The caller publishes its dynamic scope (if any) and world age, then stores the job
+#    and the command (chunk index, number of chunks, see `cmd_base`) into the
+#    `WorkerState` of the workers of chunks `2:n` (release stores, then one fence), in
+#    decreasing chunk order. The worker on the caller's thread (if any) is skipped.
 # 3. Sleeping workers are woken (`Event`) in a binary tree, as in the tree barrier of
 #    Mellor-Crummey & Scott (1991): whoever claims chunk `c` wakes the workers of chunks
 #    `2c` and `2c + 1` if they sleep, so the caller wakes at most two itself.
@@ -24,17 +24,21 @@
 #    and world age.
 # 5. The caller runs chunk 1, then "steals" every chunk its worker has not claimed (a
 #    compare-and-swap of the command from `chunk` to `0`; a worker claims with a swap to
-#    `RUNNING`) and runs it itself (`steal_chunks`), so the region does not wait for a
+#    `RUNNING`) and runs it itself (`steal_chunk!`), so the region does not wait for a
 #    worker that is asleep or not scheduled by the OS. A greedy region only takes such
 #    chunks back (`take_back_chunks`). Finally it waits until every worker it used is idle,
 #    also when a chunk threw.
+#
+# Only `dispatch!`, `job_op` and the chunks are compiled for each chunk function type; the
+# rest of a region (`region_publish!`, `steal_chunk!`, `region_finish!`, ...) is compiled
+# once, so that a new loop body costs less to compile.
 #
 # Only one region is active at a time (the `busy` flag, taken with a compare-and-swap). A
 # loop nested in a region runs serially; one started concurrently by another task runs on
 # `Threads.@spawn`ed tasks.
 #
 # Memory orderings (checked by the model in tla/README.md):
-# - The region data (the closure, the scope, the workers' slots) is stored with relaxed
+# - The region data (the job and its world age, the scope, the region's slot) is stored with relaxed
 #   stores and published by the release store of each command; the worker's sequentially
 #   consistent claim (an acquire) makes it visible. Relaxed loads suffice in the spin loop.
 # - A worker's results (`errs`, the partials buffer) are published by its release store
@@ -147,7 +151,7 @@ end
 # command, its sleep flag, the greedy counter), so that each has a cache line no other
 # field or neighbouring object shares: the field sits one word short of `CACHE_LINE` bytes
 # into the object with `CACHE_LINE` bytes after it, so its line lies within the object at
-# any 16-byte aligned address. (A worker's command and closure form a two-word pair two
+# any 16-byte aligned address. (A worker's command and job form a two-word pair two
 # words short of `CACHE_LINE`.) Apple silicon has 128-byte lines, x86 and other AArch64
 # cores 64; padding to 128 on every AArch64 CPU costs a few hundred bytes.
 const CACHE_LINE = Sys.ARCH === :aarch64 ? 128 : 64
@@ -223,7 +227,7 @@ const unsetindex! = isdefined(Base, :unsetindex!) ? Base.unsetindex! : Base._uns
 @inline field_bytes(::Type{F}) where {F} = sizeof(Base.RefValue{F})
 # Whether chunk functions of type `F` go into the workers' own slots (`COPY_BYTES`)
 @inline own_slots(::Type{F}) where {F} = field_bytes(F) <= COPY_BYTES
-# A worker's command and the closure of the region (`job_closure`), a two-word pair at a
+# A worker's command and the job of the region (`get_job`), a two-word pair at a
 # multiple of two words on a cache line of their own: one line transfer brings the worker
 # both, and the rest of the region data inside the command (`cmd_base`).
 mutable struct WorkerState
@@ -248,7 +252,7 @@ SleepFlag() = SleepFlag(pad_before(), false, pad_after())
 mutable struct Pool
     # Region data that does not travel with the commands (`cmd_base`): the dispatcher's
     # dynamic scope, `nothing` when the caller has none. Written only when it changes, so
-    # the line stays shared. (The world age travels with the closure, `job_closure`.)
+    # the line stays shared. (The world age travels with the job, `Job`.)
     @atomic scope::Any
     const workers::Vector{WorkerState}
     const events::Vector{Base.Event}
@@ -266,7 +270,7 @@ mutable struct Pool
     # more Julia threads than CPUs available to the process: spinning workers then give
     # their CPU to other OS threads now and then
     const oversubscribed::Bool
-    # Chunks the dispatcher took over from their worker (`steal_chunks`); written only by
+    # Chunks the dispatcher took over from their worker (`steal_chunk!`); written only by
     # the dispatcher, which holds `busy` (relaxed, no read-modify-write)
     @atomic stolen::Int
 end
@@ -395,44 +399,29 @@ else
     @inline generating_output() = ccall(:jl_generating_output, Cint, ()) != 0
 end
 
-# Run chunk `chunk` with the chunk function in `slot`, for the dispatcher and (in the
-# closure body) the workers. Not inlined, so that every chunk runs the same machine code:
-# inlined into `dispatch!` and the closure, the dispatcher's copy of the loop body can
-# differ in layout and speed by a few percent, and `dispatch!` compiles slower.
+# Run chunk `chunk` with the chunk function in `slot`, for the dispatcher and (in
+# `job_op`) the workers. Not inlined, so that every chunk runs the same machine code:
+# inlined into `dispatch!` and `job_op`, the dispatcher's copy of the loop body can differ
+# in layout and speed by a few percent, and `dispatch!` compiles slower.
 @noinline function run_chunk(slot::Slot{F}, chunk::Int) where {F}
     slot[](chunk)
     return nothing
 end
 
-# Generic call (`jl_f_opaque_closure_call`, valid from the worker's older world) of a
-# closure that is not a `JobClosure` (`new_job_closure`); `run_job_in_scope` calls the
-# usual type directly.
-@inline function run_job(job, k::Int, chunk::Int)
-    job(k, chunk)
-    return nothing
-end
 
 # Run the chunk of command `cmd`, claimed by worker `k` with state `ws`, in the
-# dispatcher's dynamic scope and world age. The closure and scope are read here, not
-# passed: `Any`-typed arguments would make the call dynamic and box them.
+# dispatcher's dynamic scope and world age. The job and scope are read here, not passed:
+# `Any`-typed arguments would make the call dynamic and box them.
 function run_job_in_scope(pool::Pool, ws::WorkerState, k::Int, cmd::Int)
     job = @atomic :monotonic ws.job
     chunk = cmd_chunk(cmd)
-    # The type check is here: `run_job` called with the `Any`-typed closure is itself a
-    # dynamic call (`ijl_apply_generic`) ahead of the direct call of the closure's body
-    if job isa JobClosure
-        if !cmd_has_scope(cmd)
-            # The common case: no scope to enter, no exception handler for it
-            job(k, chunk)
-        else
-            scope = @atomic :monotonic pool.scope
-            @enter_scope scope job(k, chunk)
-        end
-    elseif !cmd_has_scope(cmd)
-        run_job(job, k, chunk)
+    job = job::Job
+    if !cmd_has_scope(cmd)
+        # The common case: no scope to enter, no exception handler for it
+        call_job(job, OP_RUN_WORKER, k, chunk)
     else
         scope = @atomic :monotonic pool.scope
-        @enter_scope scope run_job(job, k, chunk)
+        @enter_scope scope call_job(job, OP_RUN_WORKER, k, chunk)
     end
     return nothing
 end
@@ -652,91 +641,112 @@ end
     return slot
 end
 
-# The workers' slots for chunk functions of type `F` (`COPY_BYTES`): slot `k` is used by
-# worker `k` only, so it stays in that worker's cache. The vector is created once per type
-# like `job_slot`'s cache, and grown when a region first needs the slots (so an image
-# holds it empty).
-@generated function worker_slot_vector(::Type{F}) where {F}
-    return :($(Slot{F}[]))
-end
-@inline function worker_slots(::Type{F}, nw::Int) where {F}
-    v = worker_slot_vector(F)
-    length(v) < nw && grow_slots!(v, nw)
-    return v
-end
-@noinline function grow_slots!(v::Vector{Slot{F}}, nw::Int) where {F}
-    while length(v) < nw
-        push!(v, Slot{F}())
-    end
-    return v
+# The chunk function reaches the workers through a `Job` per type `F`: a C function
+# pointer to `job_op(::SlotSet{F}, ...)`, an ordinary method specialization, so that it
+# can be precompiled and nothing is compiled at run time but what a new `F` needs. (An
+# opaque closure per type, called directly in about 3 ns, had its body and the compiler's
+# own code for it compiled at run time on every session's first loop with the type.) A C
+# function runs in the current world age, so the chunks run in the dispatcher's through
+# `invoke_in_world` when that is older (`call_job`). The job is created at a type's first
+# region and reused; used only while holding `POOL.busy`. Its slots are empty outside of
+# regions.
+#
+# The slots of chunk functions of type `F`: the dispatcher's (`job_slot`), and one per
+# worker for a small `F` (`COPY_BYTES`): slot `k` is used by worker `k` only, so it stays
+# in that worker's cache. Replaced, not grown, when the pool has more workers, so that
+# only its construction is compiled per type.
+mutable struct SlotSet{F}
+    const slot::Slot{F}
+    workers::Vector{Slot{F}}
 end
 
-# The closure the workers call as `job(k, chunk)`: worker `k` runs the chunk from its
-# own slot `worker_slot_vector(F)[k]` (`run_job_own`), or from the dispatcher's slot
-# `job_slot(F)` for a chunk function larger than `COPY_BYTES` (`run_chunk`).
-#
-# An opaque closure runs its body in the world age it was created in, so dynamic calls in
-# the chunk function dispatch as in a task the dispatcher would have spawned. The workers'
-# tasks are older than most chunk functions; `invoke_in_world` instead costs a method
-# lookup plus a boxed call per chunk, about 20 ns on each worker's critical path (Julia
-# 1.10 to 1.13), against 3 ns for the closure call. `run_job_in_scope` checks the closure
-# type and calls its compiled body directly; another type (`new_job_closure`) goes through
-# the generic call in `run_job`, whose arguments box without allocating.
-#
-# One closure per type `F`, cached like `job_slot` and reused while the dispatcher's world
-# age is the one it was created in; the first loop after a method definition (`include`,
-# `eval`, Revise) creates a new one, about 120 ns with the body compiled. Used only while
-# holding `POOL.busy`. It holds the slots of its type, which are empty outside of regions.
-const JobClosure = Core.OpaqueClosure{Tuple{Int, Int}, Nothing}
+mutable struct Job
+    # `job_op` for the chunk function type, as a C function pointer (`job_entry`)
+    const entry::Ptr{Cvoid}
+    const slots::Any    # `SlotSet{F}`
+    # Whether chunk functions of the type go into the workers' own slots (`own_slots`)
+    const copies::Bool
+    # Number of workers' slots
+    nslots::Int
+    # World age of the current region's dispatcher, in which its chunks run
+    @atomic world::UInt
+end
 
-@generated function job_closure_cache(::Type{F}) where {F}
+# One job per type `F`, created at its first region (see `job_slot` on why not in an
+# image), and cached like the slot.
+@generated function job_cache(::Type{F}) where {F}
     return :($(Base.RefValue{Any}(nothing)))
 end
-
-@inline function job_closure(slot::Slot{F}) where {F}
-    cache = job_closure_cache(F)
-    job = cache[]
-    world = world_age()
-    if !(job isa JobClosure && job.world == world)
-        # A dynamic call (same world), so that the closure construction is not part of
-        # `dispatch!`'s code: Enzyme compiles the primal of the loops its rules run on the
-        # team into its own module, and crashes on the construction (Julia 1.10)
-        job = Core._call_in_world(world, new_job_closure, slot, worker_slot_vector(F))
-        cache[] = job
-    end
+@inline function get_job(::Type{F}) where {F}
+    job = job_cache(F)[]
+    job isa Job && return job
+    return new_job(F)
+end
+@noinline function new_job(::Type{F}) where {F}
+    job = Job(job_entry(F), SlotSet{F}(job_slot(F), Slot{F}[]), own_slots(F), 0, world_age())
+    job_cache(F)[] = job
     return job
 end
 
-# The body of the closure (see `job_closure`)
-@inline function run_job_closure(
-        slot::Slot{F}, wslots::Vector{Slot{F}}, k::Int, chunk::Int
-    ) where {F}
-    if own_slots(F)
-        run_job_own(@inbounds(wslots[k]), chunk)
+# The workers' slots of type `F` (for tests)
+function worker_slot_vector(::Type{F}) where {F}
+    job = job_cache(F)[]
+    return job === nothing ? Slot{F}[] : job.slots.workers
+end
+
+# What `job_op` does
+const OP_RUN_WORKER = 0   # worker `k` runs chunk `chunk` (from its own slot, or the region's)
+const OP_CLEAR = 1        # clear worker `k`'s slot
+const OP_GROW = 2         # create the workers' slots up to `k`
+
+# What the workers and the region's bookkeeping do with the chunk function, so that only
+# this (and `dispatch!`) is specialized on its type, and the rest of the region is
+# compiled once.
+# Called through a C function pointer: an ordinary method specialization, which can be
+# precompiled and runs in the current world age, for a few ns per call.
+function job_op(set::SlotSet{F}, op::Int, k::Int, chunk::Int) where {F}
+    if op == OP_RUN_WORKER
+        if own_slots(F)
+            # Copied by the worker that claimed the chunk: the dispatcher's stores to the
+            # workers' lines delayed its commands
+            own = @inbounds set.workers[k]
+            own[] = set.slot[]
+            run_job_own(own, chunk)
+        else
+            run_chunk(set.slot, chunk)
+        end
+    elseif op == OP_CLEAR
+        clear_slot!(@inbounds set.workers[k])
     else
-        run_chunk(slot, chunk)
+        workers = Vector{Slot{F}}(undef, k)
+        for i in 1:k
+            @inbounds workers[i] = i <= length(set.workers) ? set.workers[i] : Slot{F}()
+        end
+        set.workers = workers
     end
     return nothing
 end
+job_entry(::Type{F}) where {F} =
+    @cfunction(job_op, Cvoid, (Ref{SlotSet{F}}, Int, Int, Int))
 
-# The closure is built by the runtime (`jl_new_opaque_closure`), its argument types hidden
-# from inference so that codegen does not build it: the runtime uses the compiled body as
-# the entry point, compiling it on the first loop with a chunk function type. Built by
-# codegen, the body lands in the module of `dispatch!`, which Enzyme's transforms do not
-# handle (segmentation fault, Julia 1.10), and on 1.12 and 1.13 the closure only gets a
-# stub that boxes the arguments and goes through `jl_invoke_oc` (13 ns and 48 bytes per
-# call). The return type can be given on Julia ≥ 1.12 only; on 1.10 and 1.11 it is the
-# inferred one, `Union{}` for a chunk function that always throws (then not a
-# `JobClosure`, see `run_job`).
-@static if VERSION >= v"1.12"
-    @noinline function new_job_closure(slot::Slot{F}, wslots::Vector{Slot{F}}) where {F}
-        return Base.Experimental.@opaque Base.inferencebarrier(Tuple{Int, Int}) -> Nothing (k, chunk) -> run_job_closure(slot, wslots, k, chunk)
+# Chunks run in the dispatcher's world age, as in a task it would have spawned. A C function
+# runs in the current world; a dispatcher in an older one (`invoke_in_world`, a task
+# that runs since before a method definition) costs a generic call per chunk instead.
+@inline function call_job(job::Job, op::Int, k::Int, chunk::Int)
+    world = @atomic :monotonic job.world
+    if world == world_counter()
+        ccall(job.entry, Cvoid, (Any, Int, Int, Int), job.slots, op, k, chunk)
+    else
+        call_job_in_world(world, job.slots, op, k, chunk)
     end
-else
-    @noinline function new_job_closure(slot::Slot{F}, wslots::Vector{Slot{F}}) where {F}
-        return Base.Experimental.@opaque Base.inferencebarrier(Tuple{Int, Int}) (k, chunk) -> run_job_closure(slot, wslots, k, chunk)
-    end
+    return nothing
 end
+# `Base.get_world_counter()` without its `ccall` (a few ns on a worker's critical path)
+@inline world_counter() =
+    Core.Intrinsics.atomic_pointerref(cglobal(:jl_world_counter, UInt), :acquire)
+
+@noinline call_job_in_world(world::UInt, slots, op::Int, k::Int, chunk::Int) =
+    Base.invoke_in_world(world, job_op, slots, op, k, chunk)
 
 # Drop the chunk function from its slot after the region, so that it and its captures can
 # be collected: `unsetindex!` nulls the element's references (removing references needs
@@ -808,7 +818,7 @@ end
 end
 
 # Called for chunk 1, and by the worker that claims chunk `chunk` before running it (a
-# chunk the dispatcher steals has no children left to wake, see `steal_chunks`): wake the
+# chunk the dispatcher steals has no children left to wake, see `steal_chunk!`): wake the
 # workers of chunks `2chunk` and `2chunk + 1` (a binary tree: `n` sleeping workers wake in
 # O(log n) steps).
 # The dispatcher stores the commands in decreasing order, so a child's command precedes
@@ -832,89 +842,164 @@ end
 function dispatch!(pool::Pool, f::F, n::Int) where {F}
     slot = job_slot(F)
     slot[] = f
-    job = job_closure(slot)
+    job = get_job(F)
+    counter = f isa GreedyJob ? f.counter : nothing
     tid = Threads.threadid()
     skip = tid <= length(pool.tid2worker) ? @inbounds(pool.tid2worker[tid]) : 0
-    # Published by the release stores of the commands; stored only when present, so the
-    # line stays shared
+    # The workers' slots are used, and need to exist, only for a small `f` (`COPY_BYTES`)
+    job.copies && job.nslots < length(pool.workers) && grow_slots!(job, length(pool.workers))
+    r = Region(n, skip, 0, false)
+    # 0: running, 1: the region's bookkeeping is done, 2: every worker is idle
+    state = 0
+    try
+        r = region_publish!(pool, job, n, skip)
+        # Chunk 1 is ours. Here and below the chunks run in this function, specialized on
+        # `F`, and the region's bookkeeping in functions compiled once.
+        run_chunk(slot, 1)   # the workers' code, see `run_chunk`
+        # The chunks that their worker has not claimed yet: a greedy region only takes them
+        # back, a static one runs them
+        if counter === nothing
+            chunk = n
+            while (chunk = steal_chunk!(pool, job, r, chunk)) >= 2
+                try
+                    run_chunk(slot, chunk)
+                catch err
+                    chunk_failed!(pool, r, chunk, err, catch_backtrace())
+                end
+                chunk -= 1
+            end
+        end
+        state = 1
+        region_finish!(pool, job, r, counter !== nothing)
+    finally
+        # Thrown by chunk 1, or outside the chunks (e.g. an interrupt while waiting for the
+        # workers): cancel the chunks that were not started and wait for the others, since
+        # running chunks use the region's slots, buffers and greedy counter
+        state == 0 && region_abort!(pool, job, r, counter)
+        # Keep the chunk function alive no longer than the region
+        clear_slot!(slot)
+    end
+    return nothing
+end
+
+# A region of `dispatch!`: `n` chunks, the worker skipped (on the dispatcher's thread) and
+# the command base (`cmd_base`). The functions below take the chunk function's `job` and
+# are compiled once, not per chunk function type.
+struct Region
+    n::Int
+    skip::Int
+    base::Int
+    has_scope::Bool
+end
+
+@noinline function grow_slots!(job::Job, nw::Int)
+    call_job(job, OP_GROW, nw, 0)
+    job.nslots = nw
+    return nothing
+end
+
+# Hand chunks `2:n` to their workers and wake the first ones
+@noinline function region_publish!(pool::Pool, job::Job, n::Int, skip::Int)
+    # Published by the release stores of the commands; stored only when present (the world
+    # age only when it changed), so the lines stay shared
     scope = current_scope()
     has_scope = scope !== nothing
     has_scope && (@atomic :monotonic pool.scope = scope)
-    # The workers' slots are used, and need to exist, only for a small `f` (`COPY_BYTES`)
-    copies = own_slots(F)
-    wslots = copies ? worker_slots(F, length(pool.workers)) : worker_slot_vector(F)
+    world = world_age()
+    (@atomic :monotonic job.world) == world || (@atomic :monotonic job.world = world)
     base = cmd_base(n, skip, has_scope)
-    # Whether every worker of the region is idle (also when a chunk threw)
-    drained = false
+    r = Region(n, skip, base, has_scope)
+    # Decreasing chunk order: see `wake_children`
+    for chunk in n:-1:2
+        k = worker_for_chunk(chunk, skip)
+        # Normally idle (an interrupted region waits for its workers); detects a dead one
+        if !wait_idle(pool, k)
+            # Take back the chunks already handed out before giving up
+            cancel_chunks(pool, chunk + 1, n, skip, base, job)
+            wait_workers(pool, chunk + 1, n, skip)
+            region_end!(pool, job, r)
+            dead_worker_error(k)
+        end
+        @inbounds pool.errs[k] = nothing
+        # Release stores: their line transfers overlap in the store buffer, where sc
+        # stores (`xchg` on x86) would each wait for the line (20% of the dispatcher's
+        # time with 8 threads). The fence below orders them before the `sleeping` loads
+        # of `wake_children` (Dekker with the worker, which stores `sleeping` and loads
+        # `cmd`). A wake-up still missed on a weakly ordered machine is repaired by the
+        # re-notify of `wait_idle`; the region only takes longer.
+        ws = @inbounds pool.workers[k]
+        @atomic :monotonic ws.job = job
+        @atomic :release ws.cmd = base | chunk
+    end
+    Threads.atomic_fence()
+    # Wake the workers of chunks 2 and 3, they wake the others
+    wake_children(pool, base | 1)
+    return r
+end
+
+# The end of a region whose own chunks ran: take back the unclaimed chunks of a greedy
+# region, wait for the workers, clean up, and rethrow the first chunk's exception
+@noinline function region_finish!(pool::Pool, job::Job, r::Region, greedy::Bool)
+    greedy && take_back_chunks(pool, job, r)
     try
-        # Decreasing chunk order: see `wake_children`
-        for chunk in n:-1:2
-            k = worker_for_chunk(chunk, skip)
-            # Normally idle (an interrupted region waits for its workers); detects a dead one
-            if !wait_idle(pool, k)
-                # Take back the chunks already handed out before giving up
-                cancel_chunks(pool, chunk + 1, n, skip, base, wslots, copies)
-                wait_workers(pool, chunk + 1, n, skip)
-                drained = true
-                dead_worker_error(k)
+        wait_workers(pool, 2, r.n, r.skip)
+    catch
+        region_abort!(pool, job, r, nothing)
+        rethrow()
+    end
+    err = nothing
+    for chunk in 2:r.n
+        e = @inbounds pool.errs[worker_for_chunk(chunk, r.skip)]
+        if e !== nothing
+            err = e
+            break
+        end
+    end
+    region_end!(pool, job, r)
+    err === nothing || throw_worker_error(err::ChunkFailedException)
+    return nothing
+end
+
+# Cancel the chunks of a region no worker has claimed and wait for the others, also when
+# interrupted again meanwhile (the region's exception is already on its way); then clean up
+@noinline function region_abort!(
+        pool::Pool, job::Job, r::Region, counter::Union{Nothing, ChunkCounter}
+    )
+    if r.base != 0   # published
+        counter === nothing || (@atomic :monotonic counter.next = typemax(Int) >> 1)
+        cancel_chunks(pool, 2, r.n, r.skip, r.base, job)
+        for chunk in 2:r.n
+            k = worker_for_chunk(chunk, r.skip)
+            while true
+                try
+                    wait_idle(pool, k)
+                    break
+                catch
+                end
             end
+        end
+    end
+    region_end!(pool, job, r)
+    return nothing
+end
+
+@noinline function chunk_failed!(pool::Pool, r::Region, chunk::Int, err, bt)
+    @inbounds pool.errs[worker_for_chunk(chunk, r.skip)] = ChunkFailedException(err, bt)
+    return nothing
+end
+
+# Keep neither the chunk function in the workers' slots, nor the scope, nor the chunks'
+# exceptions alive (every used worker is idle here, also when a chunk threw)
+@noinline function region_end!(pool::Pool, job::Job, r::Region)
+    r.has_scope && (@atomic :monotonic pool.scope = nothing)
+    for chunk in 2:r.n
+        k = worker_for_chunk(chunk, r.skip)
+        # A worker whose chunk threw, or that died with its command set
+        # (`dead_worker_error`), left the chunk function in its slot
+        if (@inbounds pool.errs[k]) !== nothing ||
+                (@atomic :monotonic (@inbounds pool.workers[k]).cmd) != 0
+            job.copies && call_job(job, OP_CLEAR, k, 0)
             @inbounds pool.errs[k] = nothing
-            # Release stores: their line transfers overlap in the store buffer, where sc
-            # stores (`xchg` on x86) would each wait for the line (20% of the dispatcher's
-            # time with 8 threads). The fence below orders them before the `sleeping` loads
-            # of `wake_children` (Dekker with the worker, which stores `sleeping` and loads
-            # `cmd`). A wake-up still missed on a weakly ordered machine is repaired by the
-            # re-notify of `wait_idle`; the region only takes longer.
-            ws = @inbounds pool.workers[k]
-            copies && (@inbounds(wslots[k])[] = f)
-            @atomic :monotonic ws.job = job
-            @atomic :release ws.cmd = base | chunk
-        end
-        Threads.atomic_fence()
-        # Chunk 1 is ours: wake the workers of chunks 2 and 3, they wake the others
-        wake_children(pool, base | 1)
-        try
-            run_chunk(slot, 1)   # the workers' code, see `run_chunk`
-        catch
-            # Cancel the chunks that were not started and wait for the others: never leave
-            # workers running when returning from the region
-            cancel_chunks(pool, 2, n, skip, base, wslots, copies)
-            wait_workers(pool, 2, n, skip)
-            drained = true
-            rethrow()
-        end
-        # The chunks that their worker has not claimed yet: a greedy region only takes them
-        # back, a static one runs them
-        if f isa GreedyJob
-            take_back_chunks(pool, n, skip, base, wslots, copies)
-        else
-            steal_chunks(pool, slot, n, skip, base, wslots, copies)
-        end
-        wait_workers(pool, 2, n, skip)
-        drained = true
-        for chunk in 2:n
-            k = worker_for_chunk(chunk, skip)
-            err = @inbounds pool.errs[k]
-            err === nothing || throw_worker_error(err::ChunkFailedException)
-        end
-    finally
-        # Thrown outside the chunks, e.g. an interrupt while waiting for the workers:
-        # running chunks use the region's slots, buffers and greedy counter, which the next
-        # region reuses, so wait for them before returning
-        drained || drain_workers(pool, f, n, skip, base, wslots, copies)
-        # Keep neither the chunk function (`clear_slot!`), nor the scope, nor the chunks'
-        # exceptions alive (every used worker is idle here, also when a chunk threw)
-        clear_slot!(slot)
-        has_scope && (@atomic :monotonic pool.scope = nothing)
-        for chunk in 2:n
-            k = worker_for_chunk(chunk, skip)
-            # A worker whose chunk threw, or that died with its command set
-            # (`dead_worker_error`), left the chunk function in its slot
-            if (@inbounds pool.errs[k]) !== nothing ||
-                    (@atomic :monotonic (@inbounds pool.workers[k]).cmd) != 0
-                copies && clear_slot!(@inbounds wslots[k])
-                @inbounds pool.errs[k] = nothing
-            end
         end
     end
     return nothing
@@ -937,25 +1022,20 @@ end
 # `2chunk + 1`) are stolen or claimed before it, so stealing it wakes no one. In increasing
 # order the dispatcher woke the children of each chunk it stole, and then stole their
 # chunks too: a short loop after the workers fell asleep woke every worker for nothing.
-@inline function steal_chunks(
-        pool::Pool, slot, n::Int, skip::Int, base::Int, wslots, copies::Bool
-    )
-    for chunk in n:-1:2
-        k = worker_for_chunk(chunk, skip)
+# Take over the next chunk below or at `from` that its worker has not claimed; returns
+# it, or 0 when there is none. The dispatcher runs it (`dispatch!`).
+@noinline function steal_chunk!(pool::Pool, job::Job, r::Region, from::Int)
+    for chunk in from:-1:2
+        k = worker_for_chunk(chunk, r.skip)
         ws = @inbounds pool.workers[k]
-        cmd = base | chunk
+        cmd = r.base | chunk
         if (@atomic :monotonic ws.cmd) == cmd &&
                 (@atomicreplace :monotonic ws.cmd cmd => 0).success
-            copies && clear_slot!(@inbounds wslots[k])
             @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + 1
-            try
-                run_chunk(slot, chunk)
-            catch err
-                @inbounds pool.errs[k] = ChunkFailedException(err, catch_backtrace())
-            end
+            return chunk
         end
     end
-    return nothing
+    return 0
 end
 
 # Take back the participants of a greedy region their worker has not claimed: when the
@@ -964,10 +1044,8 @@ end
 # would be wasted. The children are taken back too unless their worker claims first; a
 # worker not woken stays asleep, so a burst of regions shorter than a wake-up recruits one
 # level of the wake-up tree per region.
-@inline function take_back_chunks(
-        pool::Pool, n::Int, skip::Int, base::Int, wslots, copies::Bool
-    )
-    taken = cancel_chunks(pool, 2, n, skip, base, wslots, copies)
+@noinline function take_back_chunks(pool::Pool, job::Job, r::Region)
+    taken = cancel_chunks(pool, 2, r.n, r.skip, r.base, job)
     @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + taken
     return nothing
 end
@@ -986,8 +1064,9 @@ function stolen_chunks()
 end
 
 # Take the chunks `from:n` away from the workers that have not claimed them yet; returns
-# how many. A load first, relaxed, and the slots cleared: see `steal_chunks`.
-@inline function cancel_chunks(pool::Pool, from, n, skip, base, wslots, copies::Bool)
+# how many. A load first, relaxed: see `steal_chunk!`. (Their workers have not copied the
+# chunk function into their slots.)
+@inline function cancel_chunks(pool::Pool, from, n, skip, base, job::Job)
     taken = 0
     for chunk in from:n
         k = worker_for_chunk(chunk, skip)
@@ -995,7 +1074,6 @@ end
         cmd = base | chunk
         if (@atomic :monotonic ws.cmd) == cmd &&
                 (@atomicreplace :monotonic ws.cmd cmd => 0).success
-            copies && clear_slot!(@inbounds wslots[k])
             taken += 1
         end
     end
@@ -1011,24 +1089,6 @@ end
         wait_idle(pool, k) || (dead = k)
     end
     dead == 0 || dead_worker_error(dead)
-    return nothing
-end
-
-# Cancel the chunks of a region no worker has claimed and wait for the others, also when
-# interrupted again meanwhile (the region's exception is already on its way)
-@noinline function drain_workers(pool::Pool, f, n, skip, base, wslots, copies::Bool)
-    f isa GreedyJob && (@atomic :monotonic f.counter.next = typemax(Int) >> 1)
-    cancel_chunks(pool, 2, n, skip, base, wslots, copies)
-    for chunk in 2:n
-        k = worker_for_chunk(chunk, skip)
-        while true
-            try
-                wait_idle(pool, k)
-                break
-            catch
-            end
-        end
-    end
     return nothing
 end
 
@@ -1249,6 +1309,34 @@ end
         empty!(buf)   # let the partial results be collected
         release_pool()
     end
+end
+
+# Loops run serially during precompilation, so a workload never reaches the pool: compile
+# what the pool runs for a chunk function of type `F` instead
+# Not specialized: it would be compiled for every loop body, also outside precompilation
+@noinline function precompile_pool_path(@nospecialize(F::Type), @nospecialize(sched))
+    precompile(run_on_pool, (Pool, F, Int, typeof(sched)))
+    J = sched isa GreedyTeamScheduler ? GreedyJob{F} : F
+    precompile(dispatch!, (Pool, J, Int))
+    precompile(job_op, (SlotSet{J}, Int, Int, Int))
+    precompile(job_entry, (Type{J},))
+    return nothing
+end
+
+const PRECOMPILE_ONLY = ScopedValues.ScopedValue(false)
+
+"""
+    ThreadTeams.precompile_loop(f)
+
+Call `f()` during precompilation with the team loops it starts (`tforeach` and other loops
+without a result) compiled for the pool but not run: their chunk functions are not called. For precompile workloads whose loops can not
+run while precompiling (loops run serially then, so a plain workload never compiles the
+pool's code for its loop bodies). Outside of precompilation it does nothing.
+"""
+function precompile_loop(f)
+    generating_output() || return nothing
+    ScopedValues.with(f, PRECOMPILE_ONLY => true)
+    return nothing
 end
 
 """

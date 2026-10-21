@@ -130,6 +130,11 @@ function Implementation._tmapreduce(
             )
         )
     end
+    if OutputType === Nothing && generating_output()
+        # loops run serially while precompiling: compile what the pool would run instead
+        precompile_pool_path(Base.inferencebarrier(typeof(job)), sched)
+        PRECOMPILE_ONLY[] && return nothing
+    end
     job.n == 1 && return job(1)
     if OutputType === Nothing
         # `tforeach` (and `@tasks` without a reduction) has no results to combine: run the

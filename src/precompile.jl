@@ -5,10 +5,12 @@
 # Parallel loops run serially during precompilation (`generating_output`), so a workload
 # alone never reaches the pool: the worker tasks, command hand-off and waiting loops need
 # explicit statements. The workload below compiles OhMyThreads' entry points for the team
-# schedulers, the `boxed_captures` generator and the region functions (`run_fold`,
-# `dispatch!`, ...) for sample loop bodies; inferring them also compiles the compiler
-# specializations they need (about 0.3 s per session otherwise). `run_tasks` is not
-# specialized on the loop body, so one statement covers it.
+# schedulers, the `boxed_captures` generator and, through `precompile_pool_path`, the
+# region functions for sample loop bodies: the parts specialized on the body (`dispatch!`,
+# `job_op`, `run_fold`, ...) and, once, the bookkeeping that is not (`region_publish!`,
+# `region_finish!`, ...); inferring them also compiles the compiler specializations they
+# need (about 0.3 s per session otherwise). `run_tasks` is not specialized on the loop
+# body, so one statement covers it.
 
 precompile(run_tasks, (Any, Int))
 precompile(Pool, ())

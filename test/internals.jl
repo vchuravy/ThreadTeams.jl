@@ -126,3 +126,9 @@ end
         @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
     end
 end
+
+@testset "precompile_loop outside of precompilation" begin
+    ran = Ref(false)
+    @test ThreadTeams.precompile_loop(() -> (ran[] = true)) === nothing
+    @test !ran[]
+end

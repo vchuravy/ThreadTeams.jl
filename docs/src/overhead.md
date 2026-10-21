@@ -75,7 +75,8 @@ goes:
 
 A worker claims its chunk within about 20 ns of the stores and finishes about 100–150 ns
 later, of which the chunk itself takes about 60 ns. The rest is the wake-up check for its
-two children in the binary tree and the call of the chunk closure (see `job_closure` in `src/pool.jl`).
+two children in the binary tree and the call of the chunk function through its job (see `job_op` in
+`src/pool.jl`).
 
 Five details keep the hand-off at that level:
 

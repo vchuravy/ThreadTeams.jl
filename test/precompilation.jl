@@ -1,8 +1,8 @@
-# The closure the workers call (`job_closure` in src/pool.jl) is created at run time only.
-# It holds the code pointers of its session, which an image could not store, and the
-# world age it was created in. Parallel loops run serially during precompilation, so no
-# closure is created then; the precompile workload only specializes the per-type cache
-# (`job_closure_cache`), which must come out of the image empty. Checked in fresh
+# The job of a chunk function type (`get_job` in src/pool.jl) is created at run time only:
+# it holds the code pointer of its session, which an image could not store. Parallel loops
+# run serially during precompilation, so no job is created then; the precompile workload
+# only specializes the per-type cache (`job_cache`), which must come out of the image
+# empty. Checked in fresh
 # processes, since the test process has run loops already: one that loads ThreadTeams
 # from its image, and one that precompiles and loads a package whose own precompile
 # workload runs loops on the team.
@@ -32,7 +32,7 @@ end
 const REPORT = """
 function cached_types()
     Fs = Any[]
-    for mi in Base.specializations(only(methods(ThreadTeams.job_closure_cache)))
+    for mi in Base.specializations(only(methods(ThreadTeams.job_cache)))
         st = mi.specTypes
         st isa DataType || continue
         T = st.parameters[2]
@@ -43,9 +43,9 @@ function cached_types()
     end
     return Fs
 end
-jobs(Fs) = Any[job for job in (ThreadTeams.job_closure_cache(F)[] for F in Fs) if job !== nothing]
+jobs(Fs) = Any[job for job in (ThreadTeams.job_cache(F)[] for F in Fs) if job !== nothing]
 closures(Fs) = length(jobs(Fs))
-worlds_ok(jobs, w) = all(job isa ThreadTeams.JobClosure && job.world == w for job in jobs)
+worlds_ok(jobs, w) = all(job isa ThreadTeams.Job && job.world == w for job in jobs)
 """
 
 @testset "precompilation" begin
@@ -108,10 +108,13 @@ worlds_ok(jobs, w) = all(job isa ThreadTeams.JobClosure && job.world == w for jo
             using ThreadTeams
             fill_index!(x) = tforeach(i -> (x[i] = Float64(i)), eachindex(x); scheduler = TeamScheduler())
             sum_squares(x) = tmapreduce(abs2, +, x; scheduler = TeamScheduler())
+            never!(x) = tforeach(i -> error("chunk ran"), eachindex(x); scheduler = TeamScheduler())
             # Precompile workload (loops run serially during precompilation)
             let x = zeros(8)
                 fill_index!(x)
                 sum_squares(x)
+                # compiled, but its chunks do not run
+                ThreadTeams.precompile_loop(() -> never!(x))
             end
             end
             """

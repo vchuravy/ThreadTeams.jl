@@ -65,4 +65,6 @@ other, and the calling task runs most chunks itself. In Trixi.jl, threaded RK
 stage updates via Polyester together with the team made a time step about 5x slower than
 serial stage updates.
 
-**Other.** Precompilation always runs loops serially.
+**Other.** Precompilation always runs loops serially. A loop body's first parallel loop in a
+session compiles the team's code for it (about 0.1 s); a package can compile that into its image
+with `ThreadTeams.precompile_loop` in its precompile workload.
