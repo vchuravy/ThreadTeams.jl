@@ -89,6 +89,57 @@ end
     end
 end
 
+# A worker the last region saw idle is handed its next command without a check of its line
+# (`seen_idle`); a region that fails clears the flags, so that the next one checks again
+@testset "seen idle" begin
+    if NW > 1
+        # (the flags are kept only where the check is skipped, which is compiled in only on
+        # ARM; the pool sets the setting when it starts, so start it first)
+        tforeach(identity, 1:NW; scheduler = team)
+        old = ThreadTeams.TRUST_SEEN_IDLE[]
+        ThreadTeams.TRUST_SEEN_IDLE[] = true
+        try
+            kept = ThreadTeams.SKIPS_IDLE_CHECK ? NW - 1 : 0   # every worker but the caller's thread's
+            tforeach(identity, 1:NW; scheduler = team)
+            pool = ThreadTeams.POOL.pool
+            @test count(pool.seen_idle) == kept
+            @test_throws ErrorException tforeach(i -> i == NW && error("chunk $i"), 1:NW; scheduler = team)
+            @test !any(pool.seen_idle)
+            @test all(isnothing, pool.errs) && !pool.failed
+            tforeach(identity, 1:NW; scheduler = team)
+            @test count(pool.seen_idle) == kept
+        finally
+            ThreadTeams.TRUST_SEEN_IDLE[] = old
+        end
+        # chosen from the architecture, the environment variable overrides it
+        @test ThreadTeams.trusts_seen_idle(:aarch64, "")
+        @test !ThreadTeams.trusts_seen_idle(:x86_64, "")
+        @test ThreadTeams.trusts_seen_idle(:x86_64, "unseen")
+        @test !ThreadTeams.trusts_seen_idle(:aarch64, "always")
+        @test (@test_logs (:warn,) ThreadTeams.trusts_seen_idle(:x86_64, "never")) == false
+        @test ThreadTeams.TRUST_SEEN_IDLE[] == ThreadTeams.IDLE_CHECK()
+        # and the results stay right over many regions, with and without the check
+        for trust in (false, true)
+            old = ThreadTeams.TRUST_SEEN_IDLE[]
+            ThreadTeams.TRUST_SEEN_IDLE[] = trust
+            try
+                y = zeros(Int, NW)
+                for _ in 1:1000
+                    tforeach(i -> (y[i] += 1), 1:NW; scheduler = team)
+                end
+                @test all(==(1000), y)
+            finally
+                ThreadTeams.TRUST_SEEN_IDLE[] = old
+            end
+        end
+        x = zeros(Int, NW)
+        for _ in 1:1000
+            tforeach(i -> (x[i] += 1), 1:NW; scheduler = team)
+        end
+        @test all(==(1000), x)
+    end
+end
+
 # Who empties the workers' slots: chosen once per process from the CPU, the environment
 # variable overrides it
 @testset "slot clearing" begin
