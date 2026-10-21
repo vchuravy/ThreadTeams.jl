@@ -906,7 +906,11 @@ end
     # the chunk function is in `slot`.
     drained = cleared = true
     stored = false
-    local slot::Slot{F}, wslots::Vector{Slot{F}}
+    # The `finally` reads the slots only through what is assigned here, before the
+    # handler. Neither can throw: both are per-type constants (`job_slot` fills the cache,
+    # `worker_slots` grows the vector).
+    slot_cache = job_slot_cache(F)
+    wslots = worker_slot_vector(F)
     try
         # Inside the handler, so that the pool is released whatever throws (also an
         # interrupt during the first region of a type, which creates the slots)
@@ -914,13 +918,19 @@ end
         slot[] = f
         stored = true
         job = job_closure(slot)
+        # The workers' slots are used, and need to exist, only for a small `f`
+        # (`COPY_BYTES`)
+        copies && worker_slots(F, length(pool.workers))
+        # Not alone in a block (here after the join of `copies && ...`): Julia 1.13 runs
+        # `cfg_simplify!` on a const-propagated callee before inlining it, and that drops
+        # the handler's copies (`UpsilonNode`s) of the assignments of a block it merges
+        # into its successor. The `finally` would then see `drained` from before the `try`
+        # and return while workers still run chunks (test/exceptions.jl, "interrupted
+        # while waiting for the workers")
+        drained = cleared = false
         # Published by the release stores of the commands; stored only when present, so
         # the line stays shared
         has_scope && (@atomic :monotonic pool.scope = scope)
-        # The workers' slots are used, and need to exist, only for a small `f`
-        # (`COPY_BYTES`)
-        wslots = copies ? worker_slots(F, length(pool.workers)) : worker_slot_vector(F)
-        drained = cleared = false
         # Decreasing chunk order: see `wake_children`
         for chunk in n:-1:2
             k = worker_for_chunk(chunk, skip)
@@ -967,7 +977,7 @@ end
         drained || drain_workers(pool, f, n, skip, base, wslots, copies)
         # Keep neither the chunk function (`clear_slot!`), nor the scope, nor the chunks'
         # exceptions alive (every used worker is idle here, also when a chunk threw)
-        stored && clear_slot!(slot)
+        stored && clear_slot!(slot_cache[]::Slot{F})
         has_scope && (@atomic :monotonic pool.scope = nothing)
         # After a region that ended normally there is nothing left to clean up: the
         # workers' slots are empty, no chunk failed
