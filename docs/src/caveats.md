@@ -7,12 +7,13 @@ send the others to sleep (else the next loop would pay for waking them). A worke
 at once when another task is ready to run on its thread (or in the pool's shared queue);
 otherwise it keeps its core busy, and with loops back to back `top` shows all threads at
 100%. With more Julia threads than CPUs (e.g. `-t N` on N cores with Julia ≥ 1.12, which
-adds an interactive thread), spinning workers also yield their core to other OS threads
-every 5 µs (`sched_yield`); on an idle machine that would only add context switches, so
-they do not otherwise. Other processes on the same cores slow the team down and are
-slowed down, though stealing limits the damage: with one core of eight taken by another
-busy process, 16-element loops cost about 0.9 µs with stealing and 90–600 µs without
-(`-t 8` on 8 cores). Polyester.jl makes the same trade-off. `ThreadTeams.set_spin_time!(0)`
+adds an interactive thread, or threads pinned so that several share a CPU), spinning
+workers also yield their core to other OS threads every 5 µs (`sched_yield`); on an idle
+machine that would only add context switches, so they do not otherwise. Other processes
+on the same cores slow the team down and are slowed down, though stealing limits the
+damage: with one core of eight taken by another busy process, 16-element loops cost about
+0.9 µs with stealing and 90–600 µs without (`-t 8` on 8 cores). Polyester.jl makes the
+same trade-off. `ThreadTeams.set_spin_time!(0)`
 makes workers sleep at once, at the cost of a wake-up (about 10 µs) per loop;
 `ThreadTeams.shutdown!()` stops them. To keep loops fast in one part of a program with a
 short (or zero) spin time, wrap it in `ThreadTeams.parallel_phase() do ... end` (like TBB's
@@ -25,6 +26,23 @@ OpenMP runtimes do not spin by default there; the team does not adapt its defaul
 Consider `set_spin_time!(0)` with `parallel_phase`. Do not combine the team with another
 spinning team on the same threads (Polyester-threaded code, multithreaded BLAS in the
 loop body).
+
+**Thread pinning.** Workers are sticky, so pinning Julia's threads (e.g. with
+ThreadPinning.jl's `pinthreads`) pins the workers too. Pinning (and `threadinfo`,
+`getcpuids`) works while the workers exist, also while they spin or in a `parallel_phase`:
+a task scheduled on a worker's thread sends the idle worker to sleep, so it runs within
+microseconds; only a worker that runs a chunk delays it until the chunk returns. Two things
+to watch:
+
+- Pin before the first parallel loop, or call `ThreadTeams.shutdown!()` after pinning:
+  whether threads share CPUs (and idle workers must give their CPU to other threads now
+  and then) is checked when the workers are started. Julia 1.10 can not query the
+  affinity of other threads; there, a pinned calling thread counts as oversubscription.
+- With Julia ≥ 1.12, `julia -t N` adds an interactive thread, which is the main thread.
+  `pinthreads(:cores)` pins only the `:default` threads, and the OS may then run the
+  unpinned main thread (which runs chunks of the loops it starts) on the CPU of a pinned
+  worker: in one measurement this made loops with 100 µs of work 2x slower. Pin all
+  threads (`pinthreads(:cores; threadpool = :all)`) or start Julia with `-t N,0`.
 
 **Long-running tasks on worker threads.** Workers are sticky to their threads. If another
 task occupies a worker's thread without yielding, the calling task runs that worker's chunk
