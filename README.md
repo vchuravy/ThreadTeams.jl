@@ -20,10 +20,10 @@ Starting a loop costs about 0.3 µs and allocates nothing after its first run, a
 
 ## Installation
 
-The package is not registered yet:
+The package is registered, so you can install it as usual:
 
 ```julia
-pkg> add https://github.com/vchuravy/ThreadTeams.jl
+pkg> add ThreadTeams
 ```
 
 It needs Julia 1.10 or newer, OhMyThreads.jl 0.8.7 and ChunkSplitters.jl; the Enzyme rules
