@@ -1267,16 +1267,22 @@ struct GreedyJob{F}
     errs::Vector{Any}
     errchunks::Vector{Int}
     pool::Union{Pool, Nothing}   # `nothing` on spawned tasks (`run_off_pool`)
+    nparts::Int
 end
 function (g::GreedyJob)(p::Int)
     chunk = p
     try
-        while true
-            g.f(chunk)
+        g.f(chunk)
+        # With no chunks beyond the participants' first, as cheap as a static region
+        while g.m > g.nparts
             # Relaxed: the counter only claims indices; the job is published with the
-            # commands, results with the workers' release stores
+            # commands, results with the workers' release stores. A load first: once the
+            # chunks have run out the participants share the counter's line instead of
+            # taking turns writing it
+            (@atomic :monotonic g.counter.next) >= g.m && break
             chunk = @atomic :monotonic g.counter.next += 1
             chunk > g.m && break
+            g.f(chunk)
         end
     catch err
         # Stop the hand-out first: capturing the exception takes a while
@@ -1311,19 +1317,16 @@ end
 # `dispatch!`
 @inline run_on_pool(pool::Pool, f::F, n::Int, ::TeamScheduler, release::Bool = false) where {F} =
     dispatch!(pool, f, n, release)
-# With no more chunks than workers, every participant has one chunk: a static region
-function run_on_pool(
-        pool::Pool, f::F, m::Int, ::GreedyTeamScheduler, release::Bool = false
-    ) where {F}
-    p = min(m, length(pool.workers))
-    p == m ? dispatch!(pool, f, m, release) : run_greedy(pool, f, m, p, release)
-    return nothing
-end
-# The `m > p` chunks on `p ≤ nworkers()` participants
+# Also with `m ≤ nworkers()`, whose participants then skip the counter: a static region
+# specialized on `F` as well would cost each loop body about 150 ms more to compile
+# (`foreach_chunk`, compiled once per type, has both)
+@inline run_on_pool(pool::Pool, f::F, m::Int, ::GreedyTeamScheduler, release::Bool = false) where {F} =
+    run_greedy(pool, f, m, min(m, length(pool.workers)), release)
+# The `m ≥ p` chunks on `p ≤ nworkers()` participants
 @inline function run_greedy(pool::Pool, f::F, m::Int, p::Int, release::Bool) where {F}
     # Published to the workers by the (release) stores of the commands
     @atomic :monotonic pool.counter.next = p
-    job = GreedyJob(f, pool.counter, m, pool.greedy_errs, pool.greedy_errchunks, pool)
+    job = GreedyJob(f, pool.counter, m, pool.greedy_errs, pool.greedy_errchunks, pool, p)
     dispatch!(pool, job, p, release)
     return nothing
 end
@@ -1336,7 +1339,7 @@ function run_off_pool(f::F, m::Int, ::GreedyTeamScheduler) where {F}
     errchunks = zeros(Int, p)
     counter = ChunkCounter()
     @atomic :monotonic counter.next = p
-    run_tasks(GreedyJob(f, counter, m, errs, errchunks, nothing), p)
+    run_tasks(GreedyJob(f, counter, m, errs, errchunks, nothing, p), p)
     throw_greedy_errors(errs, errchunks, p)
     return nothing
 end
