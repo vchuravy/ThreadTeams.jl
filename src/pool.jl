@@ -1299,8 +1299,10 @@ end
 
 # Run `f(chunk)` for `chunk in 1:n` on the pool, which the caller holds
 @inline run_on_pool(pool::Pool, f::F, n::Int, ::TeamScheduler) where {F} = dispatch!(pool, f, n)
-function run_on_pool(pool::Pool, f::F, m::Int, ::GreedyTeamScheduler) where {F}
-    p = min(m, length(pool.workers))
+run_on_pool(pool::Pool, f::F, m::Int, ::GreedyTeamScheduler) where {F} =
+    run_greedy(pool, f, m, min(m, length(pool.workers)))
+# The `m` chunks on `p ≤ min(m, nworkers())` participants
+function run_greedy(pool::Pool, f::F, m::Int, p::Int) where {F}
     errs = pool.greedy_errs
     for k in 1:p
         @inbounds errs[k] = nothing
@@ -1357,6 +1359,88 @@ end
         finally
             release_pool()
         end
+    end
+    return nothing
+end
+
+"""
+    ThreadTeams.foreach_chunk(f, m::Int, p::Int = ThreadTeams.nworkers())
+
+Call `f(c)` for every `c in 1:m`, each once, on at most `min(p, m, nworkers())` threads at
+a time, the calling task being one of them. With as many chunks as threads, chunk `c` goes
+to the `c`-th participant (as with [`TeamScheduler`](@ref)); with more, the participants
+take chunks from a shared counter until none are left (as with
+[`GreedyTeamScheduler`](@ref)). `f` decides what a chunk is, e.g. the iterations
+`(c - 1) * n ÷ m + 1:c * n ÷ m` of a loop of `n`.
+
+Runs every chunk serially on the calling task, in order, when the team is busy (held by
+another task), when the call is nested in a team loop, while a `Threads.@threads` loop
+runs, during precompilation, and when `m ≤ 1` or `p == 1`: never on spawned tasks (like
+`busy = :serial`).
+
+Chunks that run at the same time never share a thread; a chunk runs on one thread unless
+it yields. Chunks run in the caller's dynamic scope and world age. If a chunk throws, no
+chunk is handed out after the failure is noticed, the chunks already started run to
+completion, and then the exception of the lowest failing chunk is rethrown.
+
+The region code is compiled once per type of `f`. For a concrete type `S`,
+`precompile(ThreadTeams.foreach_chunk, (S, Int, Int))` compiles all of it but the body of
+the workers' closure, which the first loop compiles when it creates the closure (a few
+milliseconds per type, against a few hundred without the statement).
+"""
+function foreach_chunk(f::F, m::Int, p::Int = nworkers()) where {F}
+    # (Below the greedy counter's value after a failure, see `GreedyJob`)
+    0 <= m <= typemax(Int) >> 2 ||
+        throw(ArgumentError("the number of chunks must be in 0:$(typemax(Int) >> 2), got $m"))
+    p >= 1 || throw(ArgumentError("the number of threads must be positive, got $p"))
+    p = min(p, m, nworkers())
+    if p <= 1
+        for c in 1:m
+            f(c)
+        end
+        return nothing
+    end
+    run_foreach_chunk(f, m, p)
+    return nothing
+end
+
+@noinline function run_foreach_chunk(f::F, m::Int, p::Int) where {F}
+    pool = in_threaded_region() ? nothing : acquire_pool()
+    if pool === nothing
+        for c in 1:m
+            f(c)
+        end
+    elseif m == p
+        prepare_job_closure(F)
+        # `dispatch!`'s exception handler releases the pool
+        dispatch!(pool, f, m, true)
+    else
+        prepare_job_closure(GreedyJob{F})
+        try
+            run_greedy(pool, f, m, p)
+        finally
+            release_pool()
+        end
+    end
+    return nothing
+end
+
+# Create the closure of `job_closure` for chunk functions of type `F` if it is missing or
+# from an older world, with a static call: `job_closure` creates it with a dynamic call
+# (for Enzyme, which never sees `foreach_chunk`), which a `precompile` statement for
+# `foreach_chunk` would not reach, leaving about 50 ms of compilation per type for the
+# first loop. The caller holds the pool, which this releases if it throws.
+@inline function prepare_job_closure(::Type{F}) where {F}
+    job = job_closure_cache(F)[]
+    (job isa JobClosure && job.world == world_age()) || new_job_closure!(F)
+    return nothing
+end
+@noinline function new_job_closure!(::Type{F}) where {F}
+    try
+        job_closure_cache(F)[] = new_job_closure(job_slot(F), worker_slot_vector(F))
+    catch
+        release_pool()
+        rethrow()
     end
     return nothing
 end

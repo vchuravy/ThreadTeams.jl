@@ -18,6 +18,7 @@ GreedyTeamScheduler
 ThreadTeams
 ThreadTeams.nworkers
 ThreadTeams.nchunks
+ThreadTeams.foreach_chunk
 ThreadTeams.set_spin_time!
 ThreadTeams.spin_time
 ThreadTeams.parallel_phase
