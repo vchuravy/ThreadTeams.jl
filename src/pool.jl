@@ -68,7 +68,7 @@ const SCOPE_BIT = 1 << (Sys.WORD_SIZE - 2)
 @inline cmd_has_scope(cmd::Int) = (cmd & SCOPE_BIT) != 0
 
 """
-    TeamScheduler()
+    TeamScheduler(; busy = :tasks)
 
 OhMyThreads.jl scheduler (also `scheduler = :team`) that runs a parallel operation on the
 worker pool: one contiguous chunk per thread of the `:default` pool, chunk 1 on the
@@ -76,29 +76,34 @@ calling task and chunk `c` on worker `c`. The calling task also runs every chunk
 worker has not picked it up in time (asleep, or not scheduled by the OS), so a loop never
 waits for an idle worker. Lowest overhead; best for balanced iterations.
 
-Only one parallel operation runs on the pool at a time. One started while another task
-uses the pool runs on `Threads.@spawn`ed tasks; one started inside a chunk (nested) runs
-serially. Chunks run in the caller's dynamic scope (`ScopedValue`s, logger) and world
-age. If chunks throw, the exception of the first failing chunk is rethrown once all
-started chunks have finished.
+Only one parallel operation runs on the pool at a time. One started inside a chunk
+(nested) runs serially. One started while another task uses the pool runs on
+`Threads.@spawn`ed tasks with `busy = :tasks` (the default), and serially on the calling
+task with `busy = :serial`, which also runs the operation serially while a
+`Threads.@threads` loop runs (in any task: the check is process-wide). Use `:serial` in
+code that is itself run in parallel by tasks or `@threads`: spreading its loops over
+threads that are busy already only oversubscribes them. Chunks run in the caller's dynamic
+scope (`ScopedValue`s, logger) and world age. If chunks throw, the exception of the first
+failing chunk is rethrown once all started chunks have finished.
 
 The task index (`OhMyThreads.WithTaskIndex`, `@task_index`) is the chunk index; for
 `chunks`/`index_chunks` inputs the position of the chunk, as with the other schedulers.
 Task-local values (`@local`) live in the persistent worker tasks: initialized once per
 worker, reused across loops.
 
-No keyword arguments. `ntasks` in particular is not supported: chunks are not guaranteed
-to run at the same time, so `@barrier` can not be used.
+`ntasks` is not supported: chunks are not guaranteed to run at the same time, so
+`@barrier` can not be used.
 """
 struct TeamScheduler <: Scheduler
-    function TeamScheduler(; kwargs...)
+    serial_when_busy::Bool
+    function TeamScheduler(; busy::Symbol = :tasks, kwargs...)
         isempty(kwargs) || unsupported_kwargs("TeamScheduler", kwargs)
-        return new()
+        return new(serial_when_busy(busy))
     end
 end
 
 """
-    GreedyTeamScheduler(; nchunks = 0, chunksize = 0)
+    GreedyTeamScheduler(; nchunks = 0, chunksize = 0, busy = :tasks)
 
 OhMyThreads.jl scheduler (also `scheduler = :greedyteam`) that runs a parallel operation
 on the worker pool with load balancing: `nchunks` contiguous chunks (default
@@ -113,8 +118,9 @@ chunks. The task index is the chunk index.
 struct GreedyTeamScheduler <: Scheduler
     nchunks::Int
     chunksize::Int
+    serial_when_busy::Bool
     function GreedyTeamScheduler(;
-            nchunks::Integer = 0, chunksize::Integer = 0,
+            nchunks::Integer = 0, chunksize::Integer = 0, busy::Symbol = :tasks,
             kwargs...
         )
         isempty(kwargs) || unsupported_kwargs("GreedyTeamScheduler", kwargs)
@@ -122,11 +128,17 @@ struct GreedyTeamScheduler <: Scheduler
             throw(ArgumentError("nchunks and chunksize must be non-negative"))
         (nchunks > 0 && chunksize > 0) &&
             throw(ArgumentError("nchunks and chunksize are mutually exclusive"))
-        return new(nchunks, chunksize)
+        return new(nchunks, chunksize, serial_when_busy(busy))
     end
 end
 
 const TeamSchedulers = Union{TeamScheduler, GreedyTeamScheduler}
+
+function serial_when_busy(busy::Symbol)
+    busy === :tasks && return false
+    busy === :serial && return true
+    throw(ArgumentError("busy must be :tasks or :serial, not $(repr(busy))"))
+end
 
 @noinline function unsupported_kwargs(name, kwargs)
     ks = join(("`$k`" for k in keys(kwargs)), ", ")
@@ -1192,10 +1204,24 @@ end
     end
 end
 
+# Is a `Threads.@threads` loop running, in any task? (A process-wide counter, which
+# `@spawn` does not touch.) An opaque call: only in non-inlined functions (`pool_busy`).
+@inline in_threaded_region() = ccall(:jl_in_threaded_region, Cint, ()) != 0
+
+# Take the pool for a loop with scheduler `sched`, or `nothing` if it can not have it.
+# With `busy = :serial`, not inside a `@threads` loop: its iterations occupy the threads,
+# and taking the pool from one of them would wake workers whose threads are running the
+# others.
+@inline function take_pool(sched::TeamSchedulers)
+    sched.serial_when_busy && in_threaded_region() && return nothing
+    return acquire_pool()
+end
+
 # How a loop runs when it can not use the pool: serially when nested in a region (or
-# during precompilation), on tasks when another task holds the pool
-@inline function no_pool_mode()
-    (generating_output() || in_region()) && return :serial
+# during precompilation, or with `busy = :serial`), on tasks when another task holds the
+# pool
+@inline function no_pool_mode(sched::TeamSchedulers)
+    (sched.serial_when_busy || generating_output() || in_region()) && return :serial
     return :tasks
 end
 
@@ -1304,15 +1330,16 @@ function run_off_pool(f::F, m::Int, ::GreedyTeamScheduler) where {F}
 end
 
 # Run `f(chunk)` for `chunk in 1:n`: in parallel if the pool is free, serially if nested,
-# on tasks if another task holds the pool. With the `TeamScheduler`, `n ≤ nworkers()`.
+# on tasks (or serially, `busy = :serial`) if another task holds the pool. With the
+# `TeamScheduler`, `n ≤ nworkers()`.
 # Not inlined: its atomics must stay out of the caller (`pool_busy`). `run_chunks` and
 # `run_fold` have Enzyme rules (ext/ThreadTeamsEnzymeCoreExt.jl): Enzyme can not
 # differentiate the team itself (atomics, long-lived tasks), so the rules differentiate
 # the chunk function and run the derivative chunks on the team.
 @noinline function run_chunks(f::F, n::Int, sched::TeamSchedulers) where {F}
-    pool = acquire_pool()
+    pool = take_pool(sched)
     if pool === nothing
-        if no_pool_mode() === :tasks
+        if no_pool_mode(sched) === :tasks
             run_off_pool(f, n, sched)
         else
             for chunk in 1:n
@@ -1356,9 +1383,9 @@ end
 @noinline function run_fold(f::F, op::Op, n::Int, sched::TeamSchedulers) where {F, Op}
     T = Base.promote_op(f, Int)
     T === Union{} && (T = Any)
-    pool = acquire_pool()
+    pool = take_pool(sched)
     if pool === nothing
-        if no_pool_mode() === :tasks
+        if no_pool_mode(sched) === :tasks
             buf = Vector{T}(undef, n)
             run_off_pool(StoreChunk{F, T}(f, buf), n, sched)
             return fold_partials(op, buf, n)

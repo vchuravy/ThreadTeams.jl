@@ -27,7 +27,11 @@ How a parallel operation runs on the team, and what that means for the code insi
   runs on `Threads.@spawn`ed tasks instead (chunk 1 on the calling task), with the same
   exception semantics, like `Threads.@threads :dynamic`. Loops nested in those chunks run
   serially while the team is busy; once it is released, the first nested loop to arrive
-  takes it. Loops may start from any thread, including the interactive pool; the worker on
+  takes it. With `busy = :serial` (`TeamScheduler(busy = :serial)`,
+  `GreedyTeamScheduler(busy = :serial)`) such a loop runs serially on the calling task
+  instead, as do loops started while a `Threads.@threads` loop runs anywhere in the process
+  (Polyester.jl's rule): in code that already runs in parallel on tasks, spreading a loop
+  over threads that are busy only oversubscribes them. Loops may start from any thread, including the interactive pool; the worker on
   the caller's own thread is then left out.
 - **Dynamic scope and world age.** Chunks run in the caller's dynamic scope
   (`ScopedValue`s and the logger set with `with_logger`) and world age, as `Threads.@spawn`

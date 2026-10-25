@@ -11,27 +11,28 @@
 Number of chunks a parallel operation over `itr` would be split into right now: with the
 [`TeamScheduler`](@ref) at most one per thread of the `:default` thread pool, with the
 [`GreedyTeamScheduler`](@ref) as many as it asks for, and at most one per element. `1`
-means the operation runs serially: with a single thread, and inside another parallel
-operation on the pool. (Loops also run serially during precompilation, but that is
-decided later.)
+means the operation runs serially: with a single thread, inside another parallel
+operation on the pool, and with `busy = :serial` while the pool is busy. (Loops also run
+serially during precompilation and, with `busy = :serial`, inside `Threads.@threads`, but
+that is decided later.)
 """
 @inline nchunks(itr, sched::TeamSchedulers = TeamScheduler()) =
     nchunks_for_length(plength(itr), sched)
 
 # Only plain and relaxed loads here (see `pool_busy`). Precompilation is detected later, in
 # `acquire_pool`.
-@inline function nchunks_for_length(len::Int, ::TeamScheduler)
+@inline function nchunks_for_length(len::Int, s::TeamScheduler)
     len <= 1 && return 1
     nw = nworkers()
     nw == 1 && return 1
-    pool_busy() && in_region() && return 1
+    pool_busy() && (s.serial_when_busy || in_region()) && return 1
     return min(nw, len)
 end
 @inline function nchunks_for_length(len::Int, g::GreedyTeamScheduler)
     len <= 1 && return 1
     nw = nworkers()
     nw == 1 && return 1
-    pool_busy() && in_region() && return 1
+    pool_busy() && (g.serial_when_busy || in_region()) && return 1
     m = g.chunksize > 0 ? cld(len, g.chunksize) : g.nchunks > 0 ? g.nchunks : 4nw
     return min(m, len)
 end

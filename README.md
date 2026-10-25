@@ -75,8 +75,8 @@ end
 
 | | |
 |---|---|
-| `TeamScheduler()`, `scheduler = :team` | OhMyThreads scheduler: one contiguous chunk per thread, run by the team |
-| `GreedyTeamScheduler(; nchunks, chunksize)`, `scheduler = :greedyteam` | more chunks than threads, taken by the caller and the workers as they become free |
+| `TeamScheduler(; busy)`, `scheduler = :team` | OhMyThreads scheduler: one contiguous chunk per thread, run by the team; `busy = :serial` runs loops that find the team busy serially instead of on tasks |
+| `GreedyTeamScheduler(; nchunks, chunksize, busy)`, `scheduler = :greedyteam` | more chunks than threads, taken by the caller and the workers as they become free |
 | `ThreadTeams.nworkers()` | maximum number of chunks, `Threads.nthreads(:default)` |
 | `ThreadTeams.nchunks(itr, [scheduler])` | number of chunks a loop over `itr` would use now (`1` = serial) |
 | `ThreadTeams.set_spin_time!(seconds)` / `spin_time()` | how long idle workers spin after a loop before they sleep (default 100 µs) |
