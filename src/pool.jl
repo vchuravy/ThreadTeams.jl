@@ -342,8 +342,9 @@ const PHASE = Threads.Atomic{Int}(0)
 
 Set how long an idle worker busy-waits for the next parallel loop before it sleeps;
 default `100e-6` (100 µs). The time counts from the end of the loop: a worker that
-finished early keeps spinning while the loop waits for the other chunks. Takes effect the
-next time a worker starts waiting.
+finished early keeps spinning while the loop waits for the other chunks. A worker that the
+loops do not use counts from the end of its own last chunk, also while other loops run.
+Takes effect the next time a worker starts waiting.
 
 Longer spinning makes loops that follow each other with short serial gaps cheaper (waking
 a sleeping worker costs about 10 µs), but idle workers keep their CPU busy for that long
@@ -499,13 +500,21 @@ end
 
 # Wait until `ws.cmd` is non-zero: spin for `SPIN_NS` after the end of the region (or while
 # a `parallel_phase` is active), then sleep on `ev`; sleep at once if another task could
-# run on this thread.
+# run on this thread. `ran_chunk`: the worker comes from a chunk, whose region may still
+# run; only then does a busy pool restart the spin time. A worker that no region uses
+# counts from the end of its last chunk or wake-up: with loops back to back the pool is
+# nearly always busy, and the worker the loops leave out (the one of the caller's thread
+# when the caller runs on the interactive thread, or the ones beyond the number of chunks)
+# would never sleep. A worker that sees the pool idle once knows its region has ended; one
+# that misses the gap before the next region takes that one for its own.
 function wait_for_command(
-        ws::WorkerState, flag::SleepFlag, ev::Base.Event, oversubscribed::Bool
+        ws::WorkerState, flag::SleepFlag, ev::Base.Event, oversubscribed::Bool,
+        ran_chunk::Bool
     )
     spins = 0
     t0 = time_ns()
     tyield = tevents = t0
+    own_region = ran_chunk
     while true
         # Relaxed: the claim below acquires the region data (published by the release store
         # of the command)
@@ -522,7 +531,9 @@ function wait_for_command(
         spins += 1
         if spins & 63 == 0
             now = time_ns()
-            pool_busy() && (t0 = now)
+            if own_region
+                pool_busy() ? (t0 = now) : (own_region = false)
+            end
             spun_out = now - t0 > SPIN_NS[]
             if (spun_out && PHASE[] == 0) || other_work()
                 # Re-check after announcing the sleep: either we see the command here, or
@@ -535,6 +546,7 @@ function wait_for_command(
                 @atomic :monotonic flag.sleeping = false
                 spins = 0
                 t0 = tyield = tevents = time_ns()
+                own_region = false
                 continue
             end
             if spun_out && now - tevents > 20_000
@@ -578,9 +590,10 @@ end
     ws = pool.workers[k]
     ev = pool.events[k]
     flag = pool.sleepflags[k]
+    ran_chunk = false
     try
         while true
-            cmd = wait_for_command(ws, flag, ev, pool.oversubscribed)
+            cmd = wait_for_command(ws, flag, ev, pool.oversubscribed, ran_chunk)
             if cmd == STOP
                 @atomic :release ws.cmd = 0
                 return true
@@ -588,6 +601,7 @@ end
             wake_children(pool, cmd)
             run_job_in_scope(pool, ws, k, cmd)
             @atomic :release ws.cmd = 0
+            ran_chunk = true
         end
     catch err
         # Thrown by the chunk, or into the task while it waited (an interrupt on its
