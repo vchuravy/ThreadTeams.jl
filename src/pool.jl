@@ -25,9 +25,8 @@
 # 5. The caller runs chunk 1, then "steals" every chunk its worker has not claimed (a
 #    compare-and-swap of the command from `chunk` to `0`; a worker claims with a swap to
 #    `RUNNING`) and runs it itself (`steal_chunks`), so the region does not wait for a
-#    worker that is asleep or not scheduled by the OS. A greedy region only takes such
-#    chunks back (`take_back_chunks`). Finally it waits until every worker it used is idle,
-#    also when a chunk threw.
+#    worker that is asleep or not scheduled by the OS. Finally it waits until every worker
+#    it used is idle, also when a chunk threw.
 #
 # Only one region is active at a time (the `busy` flag, taken with a compare-and-swap). A
 # loop nested in a region runs serially; one started concurrently by another task runs on
@@ -47,8 +46,9 @@
 #   relaxed: a stale value costs a spurious notification or a chunk run by the caller.
 #
 # With the `GreedyTeamScheduler` the loop has more chunks than workers: the region runs a
-# `GreedyJob` on `p` participants (the caller and `p - 1` workers), each claiming chunk
-# indices from a shared counter until none are left.
+# `GreedyJob` on `p` participants (the caller and `p - 1` workers), each running the chunk
+# with its own index, then claiming the chunks after `p` from a shared counter until none
+# are left.
 
 const STOP = -1
 const RUNNING = -2
@@ -107,9 +107,10 @@ end
 
 OhMyThreads.jl scheduler (also `scheduler = :greedyteam`) that runs a parallel operation
 on the worker pool with load balancing: `nchunks` contiguous chunks (default
-`4 * nworkers()`), or chunks of `chunksize` elements, which the calling task and the
-workers take from a shared counter until none are left. For loops whose iterations take
-very different times. See [`TeamScheduler`](@ref) for the semantics both share.
+`4 * nworkers()`), or chunks of `chunksize` elements. The calling task and the workers
+start with one chunk each, placed as with [`TeamScheduler`](@ref), then take the others
+from a shared counter until none are left. For loops whose iterations take very
+different times. See [`TeamScheduler`](@ref) for the semantics both share.
 
 Chunks are contiguous and reductions combine the chunk results in chunk order, so the
 operator only has to be associative and the result is deterministic for a given number of
@@ -985,13 +986,9 @@ end
         # others (`drain_workers`): never leave workers running when returning
         wake_children(pool, base | 1)
         run_chunk(slot, 1)   # the workers' code, see `run_chunk`
-        # The chunks that their worker has not claimed yet: a greedy region only takes them
-        # back, a static one runs them
-        if f isa GreedyJob
-            take_back_chunks(pool, n, skip, base, wslots, copies)
-        else
-            steal_chunks(pool, slot, n, skip, base, wslots, copies)
-        end
+        # The chunks that their worker has not claimed yet (in a greedy region, the
+        # participants: they still hold their first chunk)
+        steal_chunks(pool, slot, n, skip, base, wslots, copies)
         wait_workers(pool, 2, n, skip, wslots, clears)
         drained = cleared = true
         # Relaxed: ordered by the acquire loads of the workers' `cmd = 0` (`wait_workers`)
@@ -1083,24 +1080,10 @@ end
     return nothing
 end
 
-# Take back the participants of a greedy region their worker has not claimed: when the
-# dispatcher's own participant returns, the counter has handed out every chunk (or a chunk
-# threw), so they would find nothing to do, and running them or waking their children
-# would be wasted. The children are taken back too unless their worker claims first; a
-# worker not woken stays asleep, so a burst of regions shorter than a wake-up recruits one
-# level of the wake-up tree per region.
-@inline function take_back_chunks(
-        pool::Pool, n::Int, skip::Int, base::Int, wslots, copies::Bool
-    )
-    taken = cancel_chunks(pool, 2, n, skip, base, wslots, copies)
-    @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + taken
-    return nothing
-end
-
 """
     ThreadTeams.stolen_chunks() -> Int
 
-Number of chunks the calling task ran (static regions) or took back (greedy regions)
+Number of chunks (with [`GreedyTeamScheduler`](@ref), participants) the calling task ran
 because their worker had not picked them up in time, since the pool started. A high rate
 per region means workers are often asleep or not running (an oversubscribed machine). For
 diagnosis and benchmarks.
@@ -1255,10 +1238,14 @@ end
     return nothing
 end
 
-# The chunks of a greedy region: participant `p` claims chunk indices from the shared
-# counter and runs them until all `m` are taken. Exceptions are stored with the chunk that
-# threw, and a failing chunk stops the hand-out; chunks are claimed in increasing order,
-# so every chunk before it runs, as in a serial loop.
+# The chunks of a greedy region of `p` participants: participant `k` runs chunk `k`, then
+# claims chunk indices from the shared counter (which starts at `p`) and runs them until
+# all `m` are taken. The first chunks are placed as in a static region, so that loops
+# over the same data, back to back, find much of it in the cache of the core that
+# touched it last. Exceptions are stored with the chunk that threw, and a failing chunk
+# stops the hand-out; the counter hands out chunks in increasing order and the first
+# chunks always run (a participant whose worker has not started is run by the
+# dispatcher, see `steal_chunks`), so every chunk before it runs, as in a serial loop.
 struct GreedyJob{F}
     f::F
     counter::ChunkCounter
@@ -1267,14 +1254,14 @@ struct GreedyJob{F}
     errchunks::Vector{Int}
 end
 function (g::GreedyJob)(p::Int)
-    chunk = 0
+    chunk = p
     try
         while true
+            g.f(chunk)
             # Relaxed: the counter only claims indices; the job is published with the
             # commands, results with the workers' release stores
             chunk = @atomic :monotonic g.counter.next += 1
             chunk > g.m && break
-            g.f(chunk)
         end
     catch err
         @inbounds g.errs[p] = ChunkFailedException(err, catch_backtrace())
@@ -1299,16 +1286,20 @@ end
 
 # Run `f(chunk)` for `chunk in 1:n` on the pool, which the caller holds
 @inline run_on_pool(pool::Pool, f::F, n::Int, ::TeamScheduler) where {F} = dispatch!(pool, f, n)
-run_on_pool(pool::Pool, f::F, m::Int, ::GreedyTeamScheduler) where {F} =
-    run_greedy(pool, f, m, min(m, length(pool.workers)))
-# The `m` chunks on `p ≤ min(m, nworkers())` participants
+# With no more chunks than workers, every participant has one chunk: a static region
+function run_on_pool(pool::Pool, f::F, m::Int, ::GreedyTeamScheduler) where {F}
+    p = min(m, length(pool.workers))
+    p == m ? dispatch!(pool, f, m) : run_greedy(pool, f, m, p)
+    return nothing
+end
+# The `m > p` chunks on `p ≤ nworkers()` participants
 function run_greedy(pool::Pool, f::F, m::Int, p::Int) where {F}
     errs = pool.greedy_errs
     for k in 1:p
         @inbounds errs[k] = nothing
     end
-    # Published to the workers by the (sequentially consistent) stores of the commands
-    @atomic :monotonic pool.counter.next = 0
+    # Published to the workers by the (release) stores of the commands
+    @atomic :monotonic pool.counter.next = p
     try
         dispatch!(pool, GreedyJob(f, pool.counter, m, errs, pool.greedy_errchunks), p)
         throw_greedy_errors(errs, pool.greedy_errchunks, p)
@@ -1326,7 +1317,9 @@ function run_off_pool(f::F, m::Int, ::GreedyTeamScheduler) where {F}
     p = min(m, nworkers())
     errs = Any[nothing for _ in 1:p]
     errchunks = zeros(Int, p)
-    run_tasks(GreedyJob(f, ChunkCounter(), m, errs, errchunks), p)
+    counter = ChunkCounter()
+    @atomic :monotonic counter.next = p
+    run_tasks(GreedyJob(f, counter, m, errs, errchunks), p)
     throw_greedy_errors(errs, errchunks, p)
     return nothing
 end
@@ -1368,10 +1361,10 @@ end
 
 Call `f(c)` for every `c in 1:m`, each once, on at most `min(p, m, nworkers())` threads at
 a time, the calling task being one of them. With as many chunks as threads, chunk `c` goes
-to the `c`-th participant (as with [`TeamScheduler`](@ref)); with more, the participants
-take chunks from a shared counter until none are left (as with
-[`GreedyTeamScheduler`](@ref)). `f` decides what a chunk is, e.g. the iterations
-`(c - 1) * n ÷ m + 1:c * n ÷ m` of a loop of `n`.
+to the `c`-th participant (as with [`TeamScheduler`](@ref)); with more, participant `c`
+starts with chunk `c`, then the participants take the others from a shared counter until
+none are left (as with [`GreedyTeamScheduler`](@ref)). `f` decides what a chunk is, e.g.
+the iterations `(c - 1) * n ÷ m + 1:c * n ÷ m` of a loop of `n`.
 
 Runs every chunk serially on the calling task, in order, when the team is busy (held by
 another task), when the call is nested in a team loop, while a `Threads.@threads` loop
@@ -1379,9 +1372,10 @@ runs, during precompilation, and when `m ≤ 1` or `p == 1`: never on spawned ta
 `busy = :serial`).
 
 Chunks that run at the same time never share a thread; a chunk runs on one thread unless
-it yields. Chunks run in the caller's dynamic scope and world age. If a chunk throws, no
-chunk is handed out after the failure is noticed, the chunks already started run to
-completion, and then the exception of the lowest failing chunk is rethrown.
+it yields. Chunks run in the caller's dynamic scope and world age. If chunks throw, the
+exception of the lowest failing chunk is rethrown once the chunks already started have
+finished: every chunk before it runs, and the counter hands out no chunk after the
+failure is noticed.
 
 The region code is compiled once per type of `f`. For a concrete type `S`,
 `precompile(ThreadTeams.foreach_chunk, (S, Int, Int))` compiles all of it but the body of

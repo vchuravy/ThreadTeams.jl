@@ -58,6 +58,29 @@ add_one_chunks!(x, m, p) = foreach_chunk(AddOne(x, m), m, p)
         if NW > 2
             @test length(unique(chunk_tasks(2, NW))) <= 2
         end
+        # with more chunks than threads, participant `c` starts with chunk `c`, as in a
+        # static loop: the caller with chunk 1, the worker of participant `c` with chunk
+        # `c` unless it had not started and the caller ran the chunk instead
+        if NW > 1
+            pool = @atomic ThreadTeams.POOL.pool
+            misplaced = 0
+            for _ in 1:100, m in (NW + 1, 4NW)
+                tasks = Vector{Task}(undef, m)
+                tid = Ref(0)
+                foreach_chunk(m, NW) do c
+                    c == 1 && (tid[] = Threads.threadid())
+                    tasks[c] = current_task()
+                    return nothing
+                end
+                skip = tid[] <= length(pool.tid2worker) ? pool.tid2worker[tid[]] : 0
+                tasks[1] === ct || (misplaced += 1)
+                for c in 2:NW
+                    k = ThreadTeams.worker_for_chunk(c, skip)
+                    tasks[c] === ct || tasks[c] === pool.tasks[k] || (misplaced += 1)
+                end
+            end
+            @test misplaced == 0
+        end
     end
 
     @testset "serially when the team is busy" begin
@@ -113,6 +136,48 @@ add_one_chunks!(x, m, p) = foreach_chunk(AddOne(x, m), m, p)
             @test err == ErrorException("chunk $(min(2, m))")
             @test all(c -> !started[c] || done[c] || c == 2 || c == m, 1:m)
             @test chunk_counts(m, NW) == ones(Int, m)   # the team still works
+        end
+        # once a failure is noticed, the counter hands out no more chunks; the chunks
+        # before the failing one all run, among them the first chunk of every participant
+        p = min(NW, 4)
+        if p > 1
+            m = 8p
+            started = fill(false, m)
+            done = fill(false, m)
+            err = try
+                foreach_chunk(m, p) do c
+                    started[c] = true
+                    c == p + 1 && error("chunk $c")
+                    c == 1 ? sleep(0.02) : c > p && sleep(0.01)
+                    done[c] = true
+                end
+                nothing
+            catch e
+                e
+            end
+            @test err == ErrorException("chunk $(p + 1)")
+            @test all(done[1:p])
+            # each of the other participants was in at most one chunk when chunk `p + 1`
+            # failed, without another failure
+            @test count(started[(p + 2):m]) <= p - 1
+            @test all(c -> !started[c] || done[c], (p + 2):m)
+            # the caller's chunk fails: its exception, once the started chunks have finished
+            started = fill(false, m)
+            done = fill(false, m)
+            err = try
+                foreach_chunk(m, p) do c
+                    started[c] = true
+                    c == 1 && error("chunk 1")
+                    c == m && error("chunk $m")
+                    done[c] = true
+                end
+                nothing
+            catch e
+                e
+            end
+            @test err == ErrorException("chunk 1")
+            @test all(c -> !started[c] || done[c] || c == m, 2:m)
+            @test chunk_counts(m, p) == ones(Int, m)
         end
     end
 

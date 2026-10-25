@@ -108,7 +108,7 @@ end
         end
         if NW > 1
             # a greedy region that ends before a sleeping worker can wake up (one trivial
-            # chunk per participant) takes the participants of those workers back
+            # chunk per participant) runs the participants of those workers itself
             stolen = ThreadTeams.stolen_chunks()
             for _ in 1:50
                 counts = zeros(Int, NW)
