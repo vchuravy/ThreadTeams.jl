@@ -312,10 +312,11 @@ mutable struct Pool
     # `errs[k]`: `ChunkFailedException` of the chunk worker `k` ran, or `nothing`
     const errs::Vector{Any}
     # Set when a chunk of the region stored its exception into `errs` (by the worker
-    # before its release store of `cmd = 0`, by the dispatcher for a chunk it stole), so
-    # that after a region the dispatcher checks one line instead of every worker's `errs`;
-    # reset with `errs` by the dispatcher. `errs` is therefore all `nothing` when a region
-    # starts. On a cache line of its own (see `PadBefore`).
+    # before its release store of `cmd = 0`, by the dispatcher for a chunk it stole) or,
+    # in a greedy region, into `greedy_errs` (`GreedyJob`), so that after a region the
+    # dispatcher checks one line instead of every worker's `errs`; reset with `errs` by the
+    # dispatcher. `errs` is therefore all `nothing` when a region starts. On a cache line
+    # of its own (see `PadBefore`).
     const _pad0::PadBefore
     @atomic failed::Bool
     const _pad1::PadAfter
@@ -992,7 +993,12 @@ end
         wait_workers(pool, 2, n, skip, wslots, clears)
         drained = cleared = true
         # Relaxed: ordered by the acquire loads of the workers' `cmd = 0` (`wait_workers`)
-        (@atomic :monotonic pool.failed) && throw_first_error(pool, n, skip)
+        # (A greedy region's chunks fail inside the participants; a participant itself
+        # failing, which `run_commands` records in `errs`, is checked too)
+        if @atomic :monotonic pool.failed
+            f isa GreedyJob && throw_greedy_errors(f.errs, f.errchunks, n)
+            throw_first_error(pool, n, skip)
+        end
     finally
         # Thrown outside the chunks, e.g. an interrupt while waiting for the workers:
         # running chunks use the region's slots, buffers and greedy counter, which the next
@@ -1037,11 +1043,13 @@ end
             @inbounds pool.errs[k] = nothing
         end
     end
+    # Also when the region was interrupted before it reported them
+    fill!(pool.greedy_errs, nothing)
     @atomic :monotonic pool.failed = false
     return nothing
 end
 
-# Run the chunks of a static region their worker has not claimed (libomp's `static_steal`
+# Run the chunks (greedy participants) of a region their worker has not claimed (libomp's `static_steal`
 # schedule, with the dispatcher as the only thief). A spinning worker claims within a
 # cache-line transfer, so one that has not is asleep or not running: waiting would cost a
 # wake-up or an OS time slice. Locality: a stolen chunk is shorter than that wake-up (the
@@ -1135,7 +1143,7 @@ end
 # Cancel the chunks of a region no worker has claimed and wait for the others, also when
 # interrupted again meanwhile (the region's exception is already on its way)
 @noinline function drain_workers(pool::Pool, f, n, skip, base, wslots, copies::Bool)
-    f isa GreedyJob && (@atomic :monotonic f.counter.next = typemax(Int) >> 1)
+    f isa GreedyJob && (@atomic :monotonic f.counter.next = GREEDY_FAILED)
     cancel_chunks(pool, 2, n, skip, base, wslots, copies)
     for chunk in 2:n
         k = worker_for_chunk(chunk, skip)
@@ -1246,12 +1254,19 @@ end
 # stops the hand-out; the counter hands out chunks in increasing order and the first
 # chunks always run (a participant whose worker has not started is run by the
 # dispatcher, see `steal_chunks`), so every chunk before it runs, as in a serial loop.
+#
+# On the pool, the exception handler of each participant is the only one besides
+# `dispatch!`'s, which releases the pool: a chunk's failure also sets the pool's `failed`
+# flag, which the dispatcher checks after every region anyway, and `errs` is empty
+# between regions (cleared with the rest after a failure, `clean_up_region`), so a region
+# that ended normally neither resets nor scans it.
 struct GreedyJob{F}
     f::F
     counter::ChunkCounter
     m::Int
     errs::Vector{Any}
     errchunks::Vector{Int}
+    pool::Union{Pool, Nothing}   # `nothing` on spawned tasks (`run_off_pool`)
 end
 function (g::GreedyJob)(p::Int)
     chunk = p
@@ -1264,15 +1279,23 @@ function (g::GreedyJob)(p::Int)
             chunk > g.m && break
         end
     catch err
+        # Stop the hand-out first: capturing the exception takes a while
+        @atomic :monotonic g.counter.next = GREEDY_FAILED
         @inbounds g.errs[p] = ChunkFailedException(err, catch_backtrace())
         @inbounds g.errchunks[p] = chunk
-        @atomic :monotonic g.counter.next = typemax(Int) >> 1
+        # Relaxed: published by the worker's release store `cmd = 0`, as `errs`
+        pool = g.pool
+        pool === nothing || (@atomic :monotonic pool.failed = true)
     end
     return nothing
 end
 
-# Rethrow the exception of the lowest failing chunk of a greedy region, if any
-@inline function throw_greedy_errors(errs::Vector{Any}, errchunks::Vector{Int}, p::Int)
+# Counter value after a failure: no participant claims a chunk afterwards
+const GREEDY_FAILED = typemax(Int) >> 1
+
+# Rethrow the exception of the lowest failing chunk of a greedy region of `p` participants,
+# if any
+@noinline function throw_greedy_errors(errs::Vector{Any}, errchunks::Vector{Int}, p::Int)
     first = 0
     for k in 1:p
         if @inbounds(errs[k]) !== nothing &&
@@ -1280,34 +1303,28 @@ end
             first = k
         end
     end
-    first == 0 || throw_worker_error(@inbounds(errs[first])::ChunkFailedException)
-    return nothing
+    first == 0 && return nothing
+    throw_worker_error(@inbounds(errs[first])::ChunkFailedException)
 end
 
-# Run `f(chunk)` for `chunk in 1:n` on the pool, which the caller holds
-@inline run_on_pool(pool::Pool, f::F, n::Int, ::TeamScheduler) where {F} = dispatch!(pool, f, n)
+# Run `f(chunk)` for `chunk in 1:n` on the pool, which the caller holds; `release`: see
+# `dispatch!`
+@inline run_on_pool(pool::Pool, f::F, n::Int, ::TeamScheduler, release::Bool = false) where {F} =
+    dispatch!(pool, f, n, release)
 # With no more chunks than workers, every participant has one chunk: a static region
-function run_on_pool(pool::Pool, f::F, m::Int, ::GreedyTeamScheduler) where {F}
+function run_on_pool(
+        pool::Pool, f::F, m::Int, ::GreedyTeamScheduler, release::Bool = false
+    ) where {F}
     p = min(m, length(pool.workers))
-    p == m ? dispatch!(pool, f, m) : run_greedy(pool, f, m, p)
+    p == m ? dispatch!(pool, f, m, release) : run_greedy(pool, f, m, p, release)
     return nothing
 end
 # The `m > p` chunks on `p ≤ nworkers()` participants
-function run_greedy(pool::Pool, f::F, m::Int, p::Int) where {F}
-    errs = pool.greedy_errs
-    for k in 1:p
-        @inbounds errs[k] = nothing
-    end
+@inline function run_greedy(pool::Pool, f::F, m::Int, p::Int, release::Bool) where {F}
     # Published to the workers by the (release) stores of the commands
     @atomic :monotonic pool.counter.next = p
-    try
-        dispatch!(pool, GreedyJob(f, pool.counter, m, errs, pool.greedy_errchunks), p)
-        throw_greedy_errors(errs, pool.greedy_errchunks, p)
-    finally
-        for k in 1:p   # do not keep the exceptions alive
-            @inbounds errs[k] = nothing
-        end
-    end
+    job = GreedyJob(f, pool.counter, m, pool.greedy_errs, pool.greedy_errchunks, pool)
+    dispatch!(pool, job, p, release)
     return nothing
 end
 
@@ -1319,7 +1336,7 @@ function run_off_pool(f::F, m::Int, ::GreedyTeamScheduler) where {F}
     errchunks = zeros(Int, p)
     counter = ChunkCounter()
     @atomic :monotonic counter.next = p
-    run_tasks(GreedyJob(f, counter, m, errs, errchunks), p)
+    run_tasks(GreedyJob(f, counter, m, errs, errchunks, nothing), p)
     throw_greedy_errors(errs, errchunks, p)
     return nothing
 end
@@ -1343,16 +1360,8 @@ end
         end
         return nothing
     end
-    if sched isa TeamScheduler
-        # `dispatch!`'s exception handler releases the pool: one handler for the region
-        dispatch!(pool, f, n, true)
-    else
-        try
-            run_on_pool(pool, f, n, sched)
-        finally
-            release_pool()
-        end
-    end
+    # `dispatch!`'s exception handler releases the pool: one handler for the region
+    run_on_pool(pool, f, n, sched, true)
     return nothing
 end
 
@@ -1410,11 +1419,7 @@ end
         dispatch!(pool, f, m, true)
     else
         prepare_job_closure(GreedyJob{F})
-        try
-            run_greedy(pool, f, m, p)
-        finally
-            release_pool()
-        end
+        run_greedy(pool, f, m, p, true)
     end
     return nothing
 end
