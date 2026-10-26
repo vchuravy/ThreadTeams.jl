@@ -1017,8 +1017,10 @@ end
         # Decreasing chunk order: see `wake_children`
         for chunk in n:-1:2
             k = worker_for_chunk(chunk, skip)
-            # Normally idle (an interrupted region waits for its workers); detects a dead one
-            if !wait_idle(pool, k)
+            # Normally idle (an interrupted region waits for its workers); detects a dead one.
+            # Relaxed first: the last region's wait for the worker already acquired its
+            # results, so only a worker still busy needs `wait_idle`'s acquire loop
+            if (@atomic :monotonic (@inbounds pool.workers[k]).cmd) != 0 && !wait_idle(pool, k)
                 # Take back the chunks already handed out before giving up
                 cancel_chunks(pool, chunk + 1, n, skip, base, wslots, copies)
                 wait_workers(pool, chunk + 1, n, skip)
