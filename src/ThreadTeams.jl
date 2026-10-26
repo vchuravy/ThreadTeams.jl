@@ -16,7 +16,8 @@ sleep, so back-to-back loops pay for no task creation, scheduling or wake-up.
 
 Pool controls: [`ThreadTeams.nworkers`](@ref), [`ThreadTeams.set_spin_time!`](@ref),
 [`ThreadTeams.spin_time`](@ref), [`ThreadTeams.parallel_phase`](@ref),
-[`ThreadTeams.shutdown!`](@ref).
+[`ThreadTeams.shutdown!`](@ref). For callers that split the work themselves, a loop over
+chunk indices: [`ThreadTeams.foreach_chunk`](@ref).
 
 With Enzyme.jl loaded, parallel operations on the team can be differentiated in forward
 and reverse mode (a package extension; see the README).
@@ -33,6 +34,14 @@ for name in names(OhMyThreads)
     @eval export $name
 end
 export TeamScheduler, GreedyTeamScheduler
+@static if VERSION >= v"1.11"
+    eval(
+        Meta.parse(
+            "public nworkers, nchunks, foreach_chunk, set_spin_time!, spin_time, " *
+                "parallel_phase, shutdown!, ChunkFailedException"
+        )
+    )
+end
 
 include("pool.jl")
 include("chunks.jl")

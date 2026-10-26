@@ -720,7 +720,7 @@ end
 # merging loads across it (array sizes checked by the caller) and costs the serial loop
 # its constant strides (Trixi.jl: +4 to +8% in several kernels on Julia 1.13). A stale
 # value only makes us try the pool, or run one loop serially. Data is published with
-# acquire/release in the non-inlined `run_chunks`, `run_fold` and `dispatch!` only.
+# acquire/release in the non-inlined `run_chunks`, `run_fold` and `run_foreach_chunk`.
 @inline pool_busy() = @atomic :monotonic POOL.busy
 
 # Set while a task runs a chunk of a region on spawned tasks (`run_tasks`), inherited by
@@ -1009,7 +1009,8 @@ end
         # the handler's copies (`UpsilonNode`s) of the assignments of a block it merges
         # into its successor. The `finally` would then see `drained` from before the `try`
         # and return while workers still run chunks (test/exceptions.jl, "interrupted
-        # while waiting for the workers")
+        # while waiting for the workers"). JuliaLang/julia#63994, fixed by #63995: the
+        # workaround can go once the minimum 1.13.x has the fix
         drained = cleared = false
         # Published by the release stores of the commands; stored only when present, so
         # the line stays shared
