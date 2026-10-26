@@ -123,3 +123,51 @@ end
         ThreadTeams.set_spin_time!(old)
     end
 end
+
+@testset "timers fire while workers spin" begin
+    # Spinning workers on every thread run the event loop now and then. Without that, the
+    # timers below would wait for the spin time (`set_spin_time!(2.0)` bounds a failure).
+    if NW > 1
+        old = ThreadTeams.spin_time()
+        try
+            ThreadTeams.set_spin_time!(2.0)
+            # with a long spin time (#35)
+            for _ in 1:5
+                t = Threads.@spawn begin
+                    add_one!(zeros(64))
+                    t0 = time()
+                    sleep(0.01)
+                    time() - t0
+                end
+                ok = timedwait(() -> istaskdone(t), 10.0) === :ok
+                @test ok
+                ok && @test fetch(t) < 1.0
+            end
+            # while another task holds the team in a region whose finished workers keep
+            # spinning until it ends (#73); in a process of its own, as without the event
+            # loop it never ends
+            code = """
+            using ThreadTeams
+            const NW = ThreadTeams.nworkers()
+            for _ in 1:200
+                gate = Base.Event()
+                holder = Threads.@spawn tforeach(i -> i == 1 && wait(gate), 1:NW;
+                    scheduler = TeamScheduler())
+                while !(@atomic ThreadTeams.POOL.busy)
+                    yield()
+                end
+                sleep(0.002)
+                notify(gate)
+                wait(holder)
+            end
+            """
+            cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) --threads=$(Threads.nthreads(:default)) -e $code`
+            p = run(pipeline(cmd; stdout = devnull, stderr = devnull); wait = false)
+            exited = timedwait(() -> process_exited(p), 120.0) === :ok
+            exited || (kill(p); wait(p))
+            @test exited && success(p)
+        finally
+            ThreadTeams.set_spin_time!(old)
+        end
+    end
+end
