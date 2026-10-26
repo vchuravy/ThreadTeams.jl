@@ -456,8 +456,11 @@ function thread_affinity_masks(tids)
 end
 
 # Do these threads (one affinity mask each) have to share CPUs? Hall's condition for a
-# thread-to-CPU matching, checked for the masks of the threads and their union: e.g. two
-# threads pinned to the same CPU, or more threads than CPUs in a common mask.
+# thread-to-CPU matching, checked only for the union of the masks and for each thread's own
+# mask: e.g. two threads pinned to the same CPU, or more threads than CPUs in a common mask.
+# Exact for the layouts pinning produces (one CPU per thread, a shared mask, nested or
+# disjoint masks); masks that overlap otherwise can hide a shortage, e.g. 4 threads on
+# `{0,1}, {0,1}, {1,2}, {0,2}`.
 function oversubscribed_masks(masks::AbstractVector{<:AbstractVector{Bool}})
     isempty(masks) && return false
     count(reduce(.|, masks)) < length(masks) && return true
