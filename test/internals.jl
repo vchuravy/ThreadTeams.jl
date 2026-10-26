@@ -16,7 +16,7 @@ end
     @test L == (Sys.ARCH === :aarch64 ? 128 : 64)
     for (T, field) in [
             (ThreadTeams.ChunkCounter, :next), (ThreadTeams.WorkerState, :cmd),
-            (ThreadTeams.SleepFlag, :sleeping),
+            (ThreadTeams.SleepFlag, :sleeping), (ThreadTeams.RangeBlock, :word),
         ]
         off = Int(fieldoffset(T, findfirst(==(field), fieldnames(T))))
         for base in 0:16:(L - 16)   # every alignment of the object within a line
@@ -30,6 +30,19 @@ end
     off = Int(fieldoffset(W, findfirst(==(:cmd), fieldnames(W))))
     @test off % (2 * sizeof(Int)) == 0
     @test Int(fieldoffset(W, findfirst(==(:job), fieldnames(W)))) == off + sizeof(Int)
+    # So do the failure and stop flag of `foreach_range`
+    for (T, a, b) in [(ThreadTeams.RangeState, :err, :stop)]
+        off = Int(fieldoffset(T, findfirst(==(a), fieldnames(T))))
+        @test off % (2 * sizeof(Int)) == 0
+        @test Int(fieldoffset(T, findfirst(==(b), fieldnames(T)))) == off + sizeof(Int)
+        i = findfirst(==(:_pad1), fieldnames(T))
+        stop = Int(fieldoffset(T, i)) + sizeof(fieldtype(T, i))
+        for base in 0:16:(L - 16)
+            start = base + off - (base + off) % L
+            @test start >= base
+            @test start + L <= base + stop
+        end
+    end
 end
 
 @testset "command encoding" begin
