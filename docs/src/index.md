@@ -22,7 +22,7 @@ The package is not registered yet:
 pkg> add https://github.com/vchuravy/ThreadTeams.jl
 ```
 
-It needs Julia 1.10 or newer, OhMyThreads.jl 0.8.7 and ChunkSplitters.jl; the Enzyme rules
+It needs Julia 1.10 or newer, OhMyThreads.jl 0.8.9 and ChunkSplitters.jl; the Enzyme rules
 load with EnzymeCore.jl.
 
 ## Usage
