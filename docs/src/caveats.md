@@ -3,21 +3,25 @@
 **CPU use while idle.** After each loop, idle workers busy-wait for `spin_time()` (default
 100 µs) before they sleep. The time counts from the end of the loop: a worker that finished
 early keeps spinning while the loop waits for the other chunks, so one late chunk does not
-send the others to sleep (else the next loop would pay for waking them). A worker sleeps
-at once when another task is ready to run on its thread (or in the pool's shared queue);
-otherwise it keeps its core busy, and with loops back to back `top` shows all threads at
-100%. With more Julia threads than CPUs (e.g. `-t N` on N cores with Julia ≥ 1.12, which
-adds an interactive thread), spinning workers also yield their core to other OS threads
-every 5 µs (`sched_yield`); on an idle machine that would only add context switches, so
-they do not otherwise. Other processes on the same cores slow the team down and are
-slowed down, though stealing limits the damage: with one core of eight taken by another
-busy process, 16-element loops cost about 0.9 µs with stealing and 90–600 µs without
-(`-t 8` on 8 cores). Polyester.jl makes the same trade-off. `ThreadTeams.set_spin_time!(0)`
-makes workers sleep at once, at the cost of a wake-up (about 10 µs) per loop;
-`ThreadTeams.shutdown!()` stops them. To keep loops fast in one part of a program with a
-short (or zero) spin time, wrap it in `ThreadTeams.parallel_phase() do ... end` (like TBB's
-`parallel_phase`): idle workers then spin until it returns, across serial parts longer
-than the spin time.
+send the others to sleep (else the next loop would pay for waking them). A worker that the
+loops do not use (the last one when the caller runs on the interactive thread, as the main
+task does under `-t N` on Julia ≥ 1.12, or every worker beyond the number of chunks) sleeps
+after `spin_time()` even while loops run back to back; a finished worker that misses the
+short gap between two loops takes the next one for its own and keeps spinning. A worker
+sleeps at once when another task is ready to run on its thread (or in the pool's shared
+queue); otherwise it keeps its core busy, and with loops back to back `top` shows every
+thread whose worker the loops use at 100%. With more Julia
+threads than CPUs (e.g. `-t N` on N cores with Julia ≥ 1.12, which adds an interactive
+thread), spinning workers also yield their core to other OS threads every 5 µs
+(`sched_yield`); on an idle machine that would only add context switches, so they do not
+otherwise. Other processes on the same cores slow the team down and are slowed down, though
+stealing limits the damage: with one core of eight taken by another busy process,
+16-element loops cost about 0.9 µs with stealing and 90–600 µs without (`-t 8` on 8 cores).
+Polyester.jl makes the same trade-off. `ThreadTeams.set_spin_time!(0)` makes workers sleep
+at once, at the cost of a wake-up (about 10 µs) per loop; `ThreadTeams.shutdown!()` stops
+them. To keep loops fast in one part of a program with a short (or zero) spin time, wrap it
+in `ThreadTeams.parallel_phase() do ... end` (like TBB's `parallel_phase`): idle workers
+then spin until it returns, across serial parts longer than the spin time.
 
 **Hybrid CPUs.** On CPUs with performance and efficiency cores (recent Intel CPUs, Apple
 silicon), spinning cores take power and turbo headroom from the busy ones. LLVM's and GCC's

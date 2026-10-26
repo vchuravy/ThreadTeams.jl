@@ -14,14 +14,18 @@ using ChunkSplitters: ChunkSplitters, index_chunks
 OhMyThreads.Schedulers.from_symbol(::Val{:team}) = TeamScheduler
 OhMyThreads.Schedulers.from_symbol(::Val{:greedyteam}) = GreedyTeamScheduler
 
-function Base.show(io::IO, ::MIME"text/plain", ::TeamScheduler)
-    return print(io, "TeamScheduler\n└ Chunking: one chunk per thread")
+busy_mode(s::TeamSchedulers) = s.serial_when_busy ? "serial" : "tasks"
+function Base.show(io::IO, ::MIME"text/plain", s::TeamScheduler)
+    return print(
+        io, "TeamScheduler\n├ Chunking: one chunk per thread\n└ When busy: ", busy_mode(s)
+    )
 end
 function Base.show(io::IO, ::MIME"text/plain", g::GreedyTeamScheduler)
     return print(
-        io, "GreedyTeamScheduler\n└ Chunking: ",
+        io, "GreedyTeamScheduler\n├ Chunking: ",
         g.chunksize > 0 ? "fixed size ($(g.chunksize))" :
-            g.nchunks > 0 ? "fixed count ($(g.nchunks))" : "fixed count (4 per thread)"
+            g.nchunks > 0 ? "fixed count ($(g.nchunks))" : "fixed count (4 per thread)",
+        "\n└ When busy: ", busy_mode(g)
     )
 end
 

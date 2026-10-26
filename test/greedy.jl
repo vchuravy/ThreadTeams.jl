@@ -48,6 +48,36 @@
         end
         # the pool still works afterwards
         @test psum_greedy(collect(1.0:100.0)) == 5050.0
+        # and reports the failures of later loops, not those of earlier ones
+        for bad in (1, 2, 60, 2)
+            err = try
+                tforeach(i -> i >= bad && throw(DomainError(i)), 1:100; scheduler = GPS(chunksize = 1))
+                nothing
+            catch e
+                e
+            end
+            @test err == DomainError(bad)
+        end
+        if NW > 1
+            pool = @atomic ThreadTeams.POOL.pool
+            @test all(isnothing, pool.greedy_errs)
+            # A region cut short after its workers finished but before it reported its
+            # failure (an interrupt) leaves nothing for the next region to report
+            pool.greedy_errs[1] = ThreadTeams.ChunkFailedException(DomainError(-1), nothing)
+            pool.greedy_errchunks[1] = 1
+            @atomic pool.failed = true
+            wslots = ThreadTeams.worker_slot_vector(Nothing)
+            ThreadTeams.clean_up_region(pool, 1, 0, wslots, false, false, true)
+            @test all(isnothing, pool.greedy_errs)
+            @test !(@atomic pool.failed)
+            err = try
+                tforeach(i -> i >= 4 && throw(DomainError(i)), 1:100; scheduler = GPS(chunksize = 1))
+                nothing
+            catch e
+                e
+            end
+            @test err == DomainError(4)
+        end
     end
 
     @testset "nested" begin

@@ -33,6 +33,52 @@ end
     end
 end
 
+# Wake every worker, then run loops of `n < NW` chunks of `chunk_ns` each back to back for
+# `dur_ns`, so that the pool is busy nearly all the time, and return whether the workers
+# that no chunk went to sleep, read from inside chunk 1 of the last loop. (A worker that no
+# loop uses is not woken by one; it spins after the pool starts or `parallel_phase`.)
+function sleeping_unused_workers(n, chunk_ns, dur_ns)
+    ThreadTeams.parallel_phase(() -> nothing)
+    t0 = time_ns()
+    while time_ns() - t0 < dur_ns
+        tforeach(1:n; scheduler = team) do c
+            t = time_ns()
+            while time_ns() - t < chunk_ns
+            end
+        end
+    end
+    sleeping = Bool[]
+    tforeach(1:n; scheduler = team) do c
+        if c == 1
+            pool = @atomic ThreadTeams.POOL.pool
+            skip = get(pool.tid2worker, Threads.threadid(), 0)
+            used = [ThreadTeams.worker_for_chunk(c2, skip) for c2 in 2:n]
+            for k in 1:NW
+                (k == skip || k in used) && continue
+                push!(sleeping, @atomic pool.sleepflags[k].sleeping)
+            end
+        end
+    end
+    return sleeping
+end
+
+@testset "a worker the loops do not use sleeps" begin
+    # Busy regions do not keep a worker spinning that has no chunk in them: with loops back
+    # to back, it would never sleep (and with more threads than cores, `-t N` on N cores
+    # with an interactive thread, it takes CPU time from the others)
+    if NW > 2
+        n = NW - 1   # the workers of chunks `n + 1:NW` (and of the caller's thread) get none
+        sleeping_unused_workers(n, 1000, 1000)   # compiles
+        @test any(1:5) do _
+            s = sleeping_unused_workers(n, 10_000, 50 * ThreadTeams.SPIN_NS[])
+            !isempty(s) && all(s)
+        end
+        x = zeros(100)
+        add_one!(x)
+        @test all(==(1.0), x)
+    end
+end
+
 @testset "spin time" begin
     old = ThreadTeams.spin_time()
     @test old == 100.0e-6
@@ -62,7 +108,7 @@ end
         end
         if NW > 1
             # a greedy region that ends before a sleeping worker can wake up (one trivial
-            # chunk per participant) takes the participants of those workers back
+            # chunk per participant) runs the participants of those workers itself
             stolen = ThreadTeams.stolen_chunks()
             for _ in 1:50
                 counts = zeros(Int, NW)

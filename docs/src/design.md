@@ -6,19 +6,19 @@ How a parallel operation runs on the team, and what that means for the code insi
   contiguous chunks of nearly equal length (with ChunkSplitters.jl, as OhMyThreads does).
   Chunk 1 runs on the calling task, chunk `c` on a worker. `GreedyTeamScheduler` splits
   into `nchunks` chunks (default `4 * nworkers()`) or chunks of `chunksize` elements; the
-  caller and the workers take them from a shared counter until none are left.
+  caller and the workers each start with the chunk of their own index (as with
+  `TeamScheduler`, so back-to-back loops over the same data find it in the same caches),
+  then take the others from a shared counter until none are left.
 - **Stealing.** After chunk 1, the calling task runs every chunk its worker has not picked
   up yet (the worker is asleep, or the OS has not scheduled its thread), so a busy core or
   a sleeping worker does not stall the loop. Concurrent chunks always run on different
   threads, so `threadid()`-indexed scratch buffers are safe as long as the body does not
   yield. Do not assume chunk `c` always runs on the same thread; prefer buffers indexed by
   the task index (`@task_index`, `OhMyThreads.WithTaskIndex`), which is the chunk index.
-  With `GreedyTeamScheduler` the shared counter already balances the load: when its own
-  share is done, the calling task takes back the workers that have not started, since no
-  chunk is left for them. Workers taken back are not woken, so after a serial gap a burst
-  of short greedy loops brings the sleeping workers in over a few loops rather than all at
-  once.
-  `ThreadTeams.stolen_chunks()` counts the chunks taken over (or back) this way.
+  With `GreedyTeamScheduler` the shared counter balances the rest of the load: when the
+  counter runs out, the calling task runs the first chunk of each worker that has not
+  started.
+  `ThreadTeams.stolen_chunks()` counts the chunks taken over this way.
 - **Serial fallback.** The loop runs serially when it would get a single chunk: one thread,
   zero or one element, during precompilation, and nested inside another parallel loop on
   the team. OhMyThreads' own schedulers nested in a team loop are not affected.
@@ -27,7 +27,11 @@ How a parallel operation runs on the team, and what that means for the code insi
   runs on `Threads.@spawn`ed tasks instead (chunk 1 on the calling task), with the same
   exception semantics, like `Threads.@threads :dynamic`. Loops nested in those chunks run
   serially while the team is busy; once it is released, the first nested loop to arrive
-  takes it. Loops may start from any thread, including the interactive pool; the worker on
+  takes it. With `busy = :serial` (`TeamScheduler(busy = :serial)`,
+  `GreedyTeamScheduler(busy = :serial)`) such a loop runs serially on the calling task
+  instead, as do loops started while a `Threads.@threads` loop runs anywhere in the process
+  (Polyester.jl's rule): in code that already runs in parallel on tasks, spreading a loop
+  over threads that are busy only oversubscribes them. Loops may start from any thread, including the interactive pool; the worker on
   the caller's own thread is then left out.
 - **Dynamic scope and world age.** Chunks run in the caller's dynamic scope
   (`ScopedValue`s and the logger set with `with_logger`) and world age, as `Threads.@spawn`

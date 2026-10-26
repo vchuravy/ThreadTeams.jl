@@ -21,6 +21,6 @@ end
 
 # These measure timings or watch the workers of the pool, which is unreliable while other
 # test processes compete for the CPU
-serial = filter(in(keys(testsuite)), ["concurrency", "parallel_phase", "spin_time", "allocations"])
+serial = filter(in(keys(testsuite)), ["concurrency", "parallel_phase", "spin_time", "allocations", "foreach_chunk"])
 
 runtests(ThreadTeams, ARGS; testsuite, init_code, exeflags = [threads], serial)
