@@ -26,7 +26,7 @@ The package is registered, so you can install it as usual:
 pkg> add ThreadTeams
 ```
 
-It needs Julia 1.10 or newer, OhMyThreads.jl 0.8.7 and ChunkSplitters.jl; the Enzyme rules
+It needs Julia 1.10 or newer, OhMyThreads.jl 0.8.9 and ChunkSplitters.jl; the Enzyme rules
 load with EnzymeCore.jl.
 
 ## When to use it
