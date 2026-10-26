@@ -80,6 +80,7 @@ end
 | `ThreadTeams.nworkers()` | maximum number of chunks, `Threads.nthreads(:default)` |
 | `ThreadTeams.nchunks(itr, [scheduler])` | number of chunks a loop over `itr` would use now (`1` = serial) |
 | `ThreadTeams.foreach_chunk(f, m, [p])` | call `f(c)` for `c in 1:m` on at most `p` threads, without OhMyThreads (serially when the team is busy) |
+| `ThreadTeams.foreach_range(f, n; threads, schedule, grain)` | call `f(first, last)` over `1:n` with fixed block owners; static or stealing schedule |
 | `ThreadTeams.set_spin_time!(seconds)` / `spin_time()` | how long idle workers spin after a loop before they sleep (default 100 µs) |
 | `ThreadTeams.parallel_phase(f)` | run `f()` with idle workers spinning until it returns (no sleep between loops) |
 | `ThreadTeams.shutdown!()` | stop the workers; the next loop starts them again |
@@ -89,6 +90,41 @@ Everything else (`tforeach`, `tmapreduce`, `treduce`, `tmap`, `tmap!`, `tcollect
 schedulers, ...) is OhMyThreads.jl, re-exported. The team schedulers accept
 `AbstractArray`s (e.g. `eachindex(x)`, `1:n`, `CartesianIndices`, a `StepRange`, or an array
 to loop over by value) and `chunks`/`index_chunks` objects.
+
+### Fixed placement: `foreach_range`
+
+`ThreadTeams.foreach_range(f, n)` calls `f(first, last)` on inclusive ranges covering
+`1:n`. It assigns balanced contiguous blocks to fixed pool workers, matching
+`Threads.@threads :static`, independent of the caller's thread. A caller on a participating
+worker's thread runs that block; otherwise it waits. Late workers' blocks may be rescued.
+
+Use this for NUMA first-touch locality across loops with the same size and thread count.
+Pin threads with ThreadPinning.jl (e.g. `pinthreads(:numa)`; use `threadpool = :all` to
+include the interactive thread, or start Julia with `-t N,0`). Rescue, stealing and caller
+migration after a yield can change execution placement.
+
+```julia
+ThreadTeams.foreach_range(length(x)) do lo, hi          # static first touch
+    @views x[lo:hi] .= 0.0
+end
+ThreadTeams.foreach_range(length(x); schedule = :steal) do lo, hi
+    for i in lo:hi
+        x[i] = work(i)
+    end
+end
+```
+
+- `schedule = :static` (default): one call per block, for balanced work.
+- `schedule = :steal`: claims ranges of at most `grain` indices and steals remaining work
+  from other blocks' tails. The default grain is currently an eighth of a block.
+  Unstarted owners get time to wake; started blocks may lose work to thieves.
+  Inputs of `2^31` indices or more use static mode.
+
+Nonempty input runs as one serial `f(1, n)` call when using one participant, the team is
+busy, the call is nested, a `Threads.@threads` loop is active, or during precompilation.
+After failure, started calls finish before the first recorded exception is rethrown.
+See the [`foreach_range` reference](https://vchuravy.github.io/ThreadTeams.jl/dev/api/#ThreadTeams.foreach_range)
+for limits, grain and exception semantics.
 
 The [documentation](https://vchuravy.github.io/ThreadTeams.jl/dev) covers the design
 (chunking, stealing, serial fallback, exceptions, dynamic scope, reductions), the measured

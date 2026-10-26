@@ -49,6 +49,9 @@
 # `GreedyJob` on `p` participants (the caller and `p - 1` workers), each running the chunk
 # with its own index, then claiming the chunks after `p` from a shared counter until none
 # are left.
+#
+# `foreach_range` (src/ranges.jl) also dispatches one chunk per participant, with jobs that
+# place the blocks of its range by worker rather than by chunk.
 
 const STOP = -1
 const RUNNING = -2
@@ -178,6 +181,35 @@ mutable struct ChunkCounter
     const _pad1::PadAfter
 end
 ChunkCounter() = ChunkCounter(pad_before(), 0, pad_after())
+
+# Cache-line-separated packed range (see `pack_range`). UInt64 also on 32-bit systems:
+# Julia aligns atomic fields to their size. i686 uses SSE2 loads/stores and lock cmpxchg8b
+# (checked on Julia 1.10/1.12); ARMv7 should use ldrexd/strexd (not verified).
+mutable struct RangeBlock
+    const _pad0::PadBefore
+    @atomic word::UInt64
+    const _pad1::PadAfter
+end
+RangeBlock() = RangeBlock(pad_before(), UInt64(0), pad_after())
+
+# Per-pool range state: error/stop share a read-only line until failure; `active` has
+# its own line, read by idle workers and set/cleared by the dispatcher. Steal blocks
+# and rescue timestamps are reused between regions.
+mutable struct RangeState
+    const _pad0::NTuple{PAD_BEFORE - 1, Int}
+    @atomic err::Any
+    @atomic stop::Bool
+    const _pad1::PadAfter
+    @atomic active::Bool
+    const _pad2::PadAfter
+    const blocks::Vector{RangeBlock}
+    # Dispatcher-only first-awake timestamps; zero means not observed awake.
+    const seen::Vector{UInt64}
+end
+RangeState(nw::Int) = RangeState(
+    ntuple(_ -> 0, Val(PAD_BEFORE - 1)), nothing, false, pad_after(), false, pad_after(),
+    [RangeBlock() for _ in 1:nw], zeros(UInt64, nw)
+)
 
 # The dispatcher stores the chunk function into a slot of each worker (`worker_slots`)
 # with a typed store (so with the GC's write barrier: the slots are old, the captures may
@@ -334,6 +366,8 @@ mutable struct Pool
     # Chunks the dispatcher took over from their worker (`steal_chunks`); written only by
     # the dispatcher, which holds `busy` (relaxed, no read-modify-write)
     @atomic stolen::Int
+    # Reusable state for `foreach_range`.
+    const ranges::RangeState
 end
 
 # Global state. `busy` is held by the task running a parallel region (and by `shutdown!`);
@@ -571,10 +605,11 @@ end
 # nearly always busy, and the worker the loops leave out (the one of the caller's thread
 # when the caller runs on the interactive thread, or the ones beyond the number of chunks)
 # would never sleep. A worker that sees the pool idle once knows its region has ended; one
-# that misses the gap before the next region takes that one for its own.
+# that misses the gap before the next region takes that one for its own. `ranges`: whether
+# a range region runs (`RangeState.active`), which makes the worker yield its CPU.
 function wait_for_command(
         ws::WorkerState, flag::SleepFlag, ev::Base.Event, oversubscribed::Bool,
-        ran_chunk::Bool
+        ran_chunk::Bool, ranges::RangeState
     )
     spins = 0
     # `t0`: start of the spin time; `tstart`: start of the wait, which a busy pool does not
@@ -625,9 +660,15 @@ function wait_for_command(
                 Base.process_events()
                 tevents = now
             end
-            if oversubscribed && now - tyield > 5_000
-                # Let the OS run the other threads on this core now and then (only with
-                # more threads than CPUs: otherwise it only adds context switches)
+            if (oversubscribed || (own_region && (@atomic :monotonic ranges.active))) &&
+                    now - tyield > 5_000
+                # Yield on oversubscribed CPUs and after a chunk while a range region runs,
+                # so spinning workers do not starve its dispatcher. On M1, only 4 of 8
+                # runnable threads ran at once; waiting a 10 ms time slice made cold range
+                # launches take 4-13 ms instead of 0.3 ms.
+                # Clear `active` before releasing the pool: workers that miss the idle gap
+                # must not extend this policy to the next region. Stale reads cost one
+                # extra yield or spin. Other regions retain their existing policy.
                 os_yield()
                 tyield = now
             end
@@ -662,7 +703,7 @@ end
     ran_chunk = false
     try
         while true
-            cmd = wait_for_command(ws, flag, ev, pool.oversubscribed, ran_chunk)
+            cmd = wait_for_command(ws, flag, ev, pool.oversubscribed, ran_chunk, pool.ranges)
             if cmd == STOP
                 @atomic :release ws.cmd = 0
                 return true
@@ -698,7 +739,7 @@ function Pool()
         [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw],
         pad_before(), false, pad_after(),
         tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
-        Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed(), 0
+        Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed(), 0, RangeState(nw)
     )
     # A new task inherits its creator's dynamic scope. The workers get none, so they
     # neither keep the first caller's scope alive nor miss the fast path of
@@ -902,7 +943,8 @@ end
 # Spin until worker `k` is idle, yielding now and then so that a worker or chunk sharing
 # this thread can make progress. Returns `false` if the worker died with its command set
 # (`dead_worker_error`); the caller then waits for the other workers before it throws.
-@inline function wait_idle(pool::Pool, k::Int)
+# `give_cpu`: yield CPU time each spin on oversubscribed range regions (`wait_workers`).
+@inline function wait_idle(pool::Pool, k::Int, give_cpu::Bool = false)
     ws = @inbounds pool.workers[k]
     spins = 0
     while (@atomic :acquire ws.cmd) != 0
@@ -917,7 +959,7 @@ end
             istaskdone(@inbounds pool.tasks[k]) && return false
             yield()
         else
-            cpu_pause()
+            give_cpu ? os_yield() : cpu_pause()
             GC.safepoint()
         end
     end
@@ -931,6 +973,12 @@ end
                 "failed); call ThreadTeams.shutdown!() to start a new team"
         )
     )
+end
+
+# Calling thread's pool worker, or zero if it has none.
+@inline function caller_worker(pool::Pool)
+    tid = Threads.threadid()
+    return tid <= length(pool.tid2worker) ? @inbounds(pool.tid2worker[tid]) : 0
 end
 
 # Index of the worker that runs chunk `chunk` (≥ 2) when worker `skip` is not used
@@ -972,13 +1020,15 @@ end
 # `release`: release the pool at the end (`release_pool`), so that the region needs no
 # exception handler but this one (`run_chunks`); a caller with work to do before the
 # release (`run_fold` empties its buffer) passes `false` and releases it itself.
+# `skip`: range jobs pass their captured caller-worker index so job and dispatch agree
+# even after task migration. Other jobs sample it here through the default argument.
 # Inlined into its (non-inlined) callers: as a function of its own under its own
 # handler, nested in the caller's, it spilled about 20 more values per worker to the
 # stack (Cascade Lake: 40 ns per loop with 4 threads, 85 with 8); merging the handlers
 # without inlining gained nothing.
-@inline function dispatch!(pool::Pool, f::F, n::Int, release::Bool = false) where {F}
-    tid = Threads.threadid()
-    skip = tid <= length(pool.tid2worker) ? @inbounds(pool.tid2worker[tid]) : 0
+@inline function dispatch!(
+        pool::Pool, f::F, n::Int, release::Bool = false, skip::Int = caller_worker(pool)
+    ) where {F}
     scope = current_scope()
     has_scope = scope !== nothing
     copies = own_slots(F)
@@ -1015,6 +1065,8 @@ end
         # Published by the release stores of the commands; stored only when present, so
         # the line stays shared
         has_scope && (@atomic :monotonic pool.scope = scope)
+        # (Published by the release stores of the commands; see `wait_for_command`)
+        f isa RangeJob && (@atomic :monotonic pool.ranges.active = true)
         # Decreasing chunk order: see `wake_children`
         for chunk in n:-1:2
             k = worker_for_chunk(chunk, skip)
@@ -1040,21 +1092,25 @@ end
             @atomic :release ws.cmd = base | chunk
         end
         Threads.atomic_fence()
-        # Chunk 1 is ours: wake the workers of chunks 2 and 3, they wake the others. If it
-        # throws, the `finally` below cancels the chunks not started and waits for the
-        # others (`drain_workers`): never leave workers running when returning
-        wake_children(pool, base | 1)
+        # Range jobs wake all workers; other jobs use the tree. If chunk 1 throws,
+        # `finally` cancels pending chunks and drains started ones. RangeJob branches
+        # resolve at compile time, preserving other jobs' dispatch paths.
+        f isa RangeJob ? wake_all(pool, n, skip, base) : wake_children(pool, base | 1)
         run_chunk(slot, 1)   # the workers' code, see `run_chunk`
-        # The chunks that their worker has not claimed yet (in a greedy region, the
-        # participants: they still hold their first chunk)
-        steal_chunks(pool, slot, n, skip, base, wslots, copies)
-        wait_workers(pool, 2, n, skip, wslots, clears)
+        # Rescue unclaimed participants, allowing range owners time to wake.
+        if f isa RangeJob
+            rescue_ranges(pool, f, slot, n, skip, base, wslots, copies)
+        else
+            steal_chunks(pool, slot, n, skip, base, wslots, copies)
+        end
+        # An oversubscribed range dispatcher must yield CPU time to its workers.
+        wait_workers(pool, 2, n, skip, wslots, clears, f isa RangeJob && pool.oversubscribed)
         drained = cleared = true
-        # Relaxed: ordered by the acquire loads of the workers' `cmd = 0` (`wait_workers`)
-        # (A greedy region's chunks fail inside the participants; a participant itself
-        # failing, which `run_commands` records in `errs`, is checked too)
+        # Acquired by `wait_workers`. Check job-level failures, then participant failures
+        # recorded by `run_commands`.
         if @atomic :monotonic pool.failed
             f isa GreedyJob && throw_greedy_errors(f.errs, f.errchunks, n)
+            f isa RangeJob && throw_range_error(f.state)
             throw_first_error(pool, n, skip)
         end
     finally
@@ -1068,8 +1124,13 @@ end
         has_scope && (@atomic :monotonic pool.scope = nothing)
         # After a region that ended normally there is nothing left to clean up: the
         # workers' slots are empty, no chunk failed
-        (cleared && !(@atomic :monotonic pool.failed)) ||
+        if !(cleared && !(@atomic :monotonic pool.failed))
             clean_up_region(pool, n, skip, wslots, copies, clears, cleared)
+            # Drop a range error superseded by an interrupt.
+            f isa RangeJob && clear_range_error!(f.state)
+        end
+        # Clear before releasing the pool, including after failure or interruption.
+        f isa RangeJob && (@atomic :monotonic pool.ranges.active = false)
         release && release_pool()
     end
     return nothing
@@ -1184,11 +1245,15 @@ end
 # The same, emptying the slot of each worker (`copies`) as soon as the worker is idle: the
 # stores overlap the wait for the others, so that only the last worker's is on the
 # dispatcher's way out of the region (`worker_slot_vector`)
-@inline function wait_workers(pool::Pool, from, n, skip, wslots, copies::Bool)
+# `give_cpu` prevents an oversubscribed dispatcher from starving a worker: on Orin
+# with `-t 6,1`, spinning stretched a 20 µs range to 2 ms.
+@inline function wait_workers(
+        pool::Pool, from, n, skip, wslots, copies::Bool, give_cpu::Bool = false
+    )
     dead = 0
     for chunk in from:n
         k = worker_for_chunk(chunk, skip)
-        if wait_idle(pool, k)
+        if wait_idle(pool, k, give_cpu)
             copies && clear_slot!(@inbounds wslots[k])
         else
             dead = k
@@ -1202,6 +1267,7 @@ end
 # interrupted again meanwhile (the region's exception is already on its way)
 @noinline function drain_workers(pool::Pool, f, n, skip, base, wslots, copies::Bool)
     f isa GreedyJob && (@atomic :monotonic f.counter.next = GREEDY_FAILED)
+    f isa RangeJob && (@atomic :monotonic f.state.stop = true)
     cancel_chunks(pool, 2, n, skip, base, wslots, copies)
     for chunk in 2:n
         k = worker_for_chunk(chunk, skip)
