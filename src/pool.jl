@@ -348,6 +348,9 @@ const POOL = PoolHolder(false, nothing, nothing)
 
 # Spin time of an idle worker before it goes to sleep, in nanoseconds
 const SPIN_NS = Threads.Atomic{Int}(100_000)
+# How long an idle worker spins before it runs the event loop (every 20 µs): independent
+# of the spin time, so that long spin times do not hold up timers and I/O (#35)
+const EVENTS_NS = 100_000
 # Number of active `parallel_phase`s; while > 0, idle workers do not go to sleep on time
 const PHASE = Threads.Atomic{Int}(0)
 
@@ -526,7 +529,9 @@ function wait_for_command(
         ran_chunk::Bool
     )
     spins = 0
-    t0 = time_ns()
+    # `t0`: start of the spin time; `tstart`: start of the wait, which a busy pool does not
+    # restart
+    t0 = tstart = time_ns()
     tyield = tevents = t0
     own_region = ran_chunk
     while true
@@ -559,14 +564,16 @@ function wait_for_command(
                 # Relaxed: a waker that still sees `true` only notifies once too often
                 @atomic :monotonic flag.sleeping = false
                 spins = 0
-                t0 = tyield = tevents = time_ns()
+                t0 = tstart = tyield = tevents = time_ns()
                 own_region = false
                 continue
             end
-            if spun_out && now - tevents > 20_000
-                # Spinning longer than usual (a `parallel_phase`): run the libuv event loop
-                # now and then, as the scheduler would on an idle thread; otherwise, with a
-                # worker on every thread, timers and I/O would never complete
+            if now - tstart > EVENTS_NS && now - tevents > 20_000
+                # Spinning longer than usual (a `parallel_phase`, a long spin time, a region
+                # of its own that runs on): run the libuv event loop now and then, as the
+                # scheduler would on an idle thread. Otherwise, with a worker on every
+                # thread, timers and I/O would wait for the spinning to end, and a task
+                # that holds the pool until a timer fires would never get it back (#73)
                 Base.process_events()
                 tevents = now
             end
