@@ -231,6 +231,106 @@ end
         end
     end
 
+    @testset "steal clocks" begin
+        TT = ThreadTeams
+        YES, SOON, NO = TT.STEAL_YES, TT.STEAL_SOON, TT.STEAL_NO
+        A = UInt64(TT.RANGE_AWAKE_NS)
+        t, d = UInt64(10^9), UInt64(10^9 + 10^6)
+        # `owner_due` and `unstarted_verdict` with explicit clocks, on a block of its own.
+        # Observations in sequence: no simultaneous observers.
+        b = TT.RangeBlock()
+        seen() = @atomic b.seen
+        verdict(pending, asleep, now) = TT.unstarted_verdict(b, pending, asleep, now, d)
+        # an awake owner with its command pending: soon, then due, from the first
+        # observation, which later ones do not renew
+        @test verdict(true, false, t) == SOON && seen() == t
+        @test verdict(true, false, t + A - 1) == SOON && seen() == t
+        @test verdict(true, false, t + A) == YES && seen() == t
+        @test TT.owner_due(b, false, t + A, d) && !TT.owner_due(b, false, t + A - 1, d)
+        # asleep: protected until the deadline; the clock survives the observation
+        @test verdict(true, true, t + 2A) == NO && seen() == t
+        @test verdict(true, false, t + 2A) == YES
+        @test verdict(true, true, d) == YES
+        b = TT.RangeBlock()
+        @test verdict(true, true, t) == NO && seen() == 0
+        @test !TT.owner_due(b, true, t, d) && seen() == 0
+        # claimed (or no command, as the caller's block): protected until the deadline
+        @test verdict(false, false, t) == NO && verdict(false, false, d - 1) == NO
+        @test verdict(false, false, d) == YES && seen() == 0
+        # an observer that read the clock before another's timestamp waits, rather than
+        # wrapping around to due; later ones use the first timestamp
+        @test verdict(true, false, t + 5) == SOON && seen() == t + 5
+        @test verdict(true, false, t) == SOON && seen() == t + 5
+        @test !TT.owner_due(b, false, t, d)
+        @test verdict(true, false, t + 4 + A) == SOON
+        @test verdict(true, false, t + 5 + A) == YES
+        # a timestamp in the future is not due before the deadline
+        @atomic b.seen = d - 1
+        @test verdict(true, false, t) == SOON && !TT.owner_due(b, false, t, d)
+
+        # A pool whose workers never run: its commands stay pending, its owners awake
+        function idle_pool(nw)
+            return TT.Pool(
+                nothing, [TT.WorkerState() for _ in 1:nw], [Base.Event(true) for _ in 1:nw],
+                [Task(() -> nothing) for _ in 1:nw], Any[nothing for _ in 1:nw],
+                TT.pad_before(), false, TT.pad_after(), zeros(Int, Threads.maxthreadid()),
+                [TT.SleepFlag() for _ in 1:nw], TT.ChunkCounter(), Any[nothing for _ in 1:nw],
+                zeros(Int, nw), false, 0, TT.RangeState(nw)
+            )
+        end
+        # `1:100` in blocks 1:50 and 51:100; the caller (`skip = 1`) has run block 1, and
+        # worker 2 has chunk 2 pending
+        function fixture(deadline)
+            pool = idle_pool(2)
+            st = pool.ranges
+            calls = Tuple{Int, Int}[]
+            j = TT.StealRanges(
+                (lo, hi) -> (push!(calls, (lo, hi)); nothing), st.blocks, 50, 0, 2, 1, 10,
+                deadline, st, pool
+            )
+            TT.init_blocks!(st.blocks, 50, 0, 2)
+            @atomic st.blocks[1].word = TT.pack_range(true, 50, 50)
+            base = TT.cmd_base(2, 1, false)
+            @atomic pool.workers[2].cmd = base | 2
+            return pool, j, base, calls
+        end
+        # thieves rescan while an owner may become due, then take its block
+        pool, j, base, calls = fixture(typemax(UInt64))
+        @test TT.steal_allowed(j, 2) == SOON
+        @atomic j.blocks[2].seen = UInt64(0)   # the scan's first observation: soon
+        TT.run_steal(j, 1)
+        @test ((_, lo, hi) = TT.unpack_range(@atomic j.blocks[2].word); lo == hi)
+        @test sum(c -> c[2] - c[1] + 1, calls) == 50 && minimum(first, calls) == 51
+        # the dispatcher's rescue starts the block's shared clock...
+        pool, j, base, calls = fixture(typemax(UInt64))
+        slot = TT.Slot{typeof(j)}()
+        slot[] = j
+        TT.rescue_ranges(pool, j, slot, 2, 1, base, typeof(slot)[], false)
+        @test (@atomic pool.workers[2].cmd) == 0 && (@atomic j.blocks[2].seen) != 0
+        @test sum(c -> c[2] - c[1] + 1, calls) == 50
+        # ...and waits for one a thief started, here as if in the future
+        pool, j, base, calls = fixture(typemax(UInt64))
+        slot = TT.Slot{typeof(j)}()
+        slot[] = j
+        t0 = time_ns()
+        @atomic j.blocks[2].seen = t0 + 3_000_000
+        TT.rescue_ranges(pool, j, slot, 2, 1, base, typeof(slot)[], false)
+        @test time_ns() - t0 >= 3_000_000 && (@atomic pool.workers[2].cmd) == 0
+        @test sum(c -> c[2] - c[1] + 1, calls) == 50
+
+        # each region starts with fresh clocks
+        pool = @atomic TT.POOL.pool
+        if pool !== nothing
+            st = pool.ranges
+            for k in 1:NW
+                @atomic st.blocks[k].seen = UInt64(1)
+            end
+            t0 = time_ns()
+            foreach_range((lo, hi) -> nothing, 100NW; schedule = :steal)
+            @test all(k -> (s = @atomic st.blocks[k].seen; s == 0 || s >= t0), 1:NW)
+        end
+    end
+
     @testset "argument checks" begin
         @test_throws ArgumentError foreach_range((lo, hi) -> nothing, -1)
         @test_throws ArgumentError foreach_range((lo, hi) -> nothing, (typemax(Int) >> 2) + 1)
