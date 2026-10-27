@@ -44,6 +44,7 @@ export TeamScheduler, GreedyTeamScheduler
     )
 end
 
+include("topology.jl")
 include("pool.jl")
 include("ranges.jl")
 include("chunks.jl")

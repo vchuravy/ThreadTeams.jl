@@ -196,3 +196,114 @@ end
     @test over([mask(0:7...) for _ in 1:9])
     @test ThreadTeams.is_oversubscribed() isa Bool
 end
+
+# Victim orders of steal regions on synthetic topologies: per worker an LLC id, a node
+# (index into the distance matrix)
+@testset "victim orders" begin
+    orders = ThreadTeams.victim_orders
+    # Each order lists the other workers once, its local part on the worker's node, and
+    # restricted to the blocks of a smaller team (`p < nworkers()`) still covers them
+    function valid(vo, node)
+        nw = length(vo.order)
+        return all(1:nw) do w
+            o = vo.order[w]
+            sort(o) == setdiff(1:nw, w) && all(v -> node[v] == node[w], o[1:vo.nlocal[w]]) &&
+                all(p -> sort(filter(<=(p), o)) == setdiff(1:p, w), w:nw)
+        end
+    end
+    d2 = [10 20; 20 10]
+    # 2 nodes x 2 LLCs, compact (`pinthreads(:cores)`): the LLC, the rest of the node
+    # (after w, wrapping), then the remote node from w's rank in its own
+    llc = [0, 0, 2, 2, 4, 4, 6, 6]
+    node = [1, 1, 1, 1, 2, 2, 2, 2]
+    vo = orders(llc, node, d2)
+    @test valid(vo, node)
+    @test vo.order[1] == [2, 3, 4, 5, 6, 7, 8] && vo.nlocal[1] == 3
+    @test vo.order[4] == [3, 1, 2, 8, 5, 6, 7] && vo.nlocal[4] == 3
+    @test vo.order[6] == [5, 7, 8, 2, 3, 4, 1] && vo.nlocal[6] == 3
+    # round-robin over the nodes (`pinthreads(:numa)`)
+    llc = [0, 1, 0, 1, 4, 5, 4, 5]
+    node = [1, 2, 1, 2, 1, 2, 1, 2]
+    vo = orders(llc, node, d2)
+    @test valid(vo, node)
+    @test vo.order[1] == [3, 5, 7, 2, 4, 6, 8] && vo.nlocal[1] == 3
+    @test vo.order[8] == [6, 2, 4, 7, 1, 3, 5] && vo.nlocal[8] == 3
+    # sub-NUMA clustering: an LLC spans the two nodes of a socket, which are nearer to
+    # each other than to the other socket's (ties by node)
+    llc = [0, 0, 0, 0, 4, 4, 4, 4]
+    node = [1, 1, 2, 2, 3, 3, 4, 4]
+    d4 = [10 12 21 21; 12 10 21 21; 21 21 10 12; 21 21 12 10]
+    vo = orders(llc, node, d4)
+    @test valid(vo, node)
+    @test vo.order[2] == [1, 4, 3, 6, 5, 8, 7] && vo.nlocal[2] == 1
+    @test vo.order[5] == [6, 7, 8, 1, 2, 3, 4] && vo.nlocal[5] == 1
+    # one node with two LLCs (a Ryzen with two CCDs)
+    vo = orders([0, 0, 2, 2], ones(Int, 4), fill(10, 1, 1))
+    @test vo.order[1] == [2, 3, 4] && vo.order[3] == [4, 1, 2] && vo.nlocal == fill(3, 4)
+    # nothing to order by: cyclic
+    @test orders([0, 1, 2, 3], ones(Int, 4), fill(10, 1, 1)) === nothing   # no shared cache
+    @test orders(zeros(Int, 4), ones(Int, 4), fill(10, 1, 1)) === nothing
+    @test orders([0], [1], fill(10, 1, 1)) === nothing
+end
+
+# The topology from a fake sysfs tree
+@testset "sysfs topology" begin
+    @test ThreadTeams.parse_cpulist("0-7,16-23\n") == [0:7; 16:23]
+    @test ThreadTeams.parse_cpulist("3\n") == [3] && isempty(ThreadTeams.parse_cpulist("\n"))
+    function fake(root; ncpu = 8, llc = 4, nodes = [0:3, 4:7], distance = true, l3 = true)
+        for c in 0:(ncpu - 1)
+            caches = [(1, "Data", "$c"), (1, "Instruction", "$c"), (2, "Unified", "$c")]
+            first = c - c % llc
+            l3 && push!(caches, (3, "Unified", "$first-$(first + llc - 1)"))
+            for (i, (level, type, shared)) in enumerate(caches)
+                dir = mkpath(joinpath(root, "cpu", "cpu$c", "cache", "index$(i - 1)"))
+                write(joinpath(dir, "level"), "$level\n")
+                write(joinpath(dir, "type"), "$type\n")
+                write(joinpath(dir, "shared_cpu_list"), "$shared\n")
+            end
+        end
+        for (i, cpus) in enumerate(nodes)
+            dir = mkpath(joinpath(root, "node", "node$(i - 1)"))
+            write(joinpath(dir, "cpulist"), "$(first(cpus))-$(last(cpus))\n")
+            distance && write(
+                joinpath(dir, "distance"),
+                join([j == i ? 10 : 10 + 11abs(i - j) for j in eachindex(nodes)], ' ') * "\n"
+            )
+        end
+        mkpath(joinpath(root, "node"))
+        write(joinpath(root, "node", "online"), "0-$(length(nodes) - 1)\n")
+        return root
+    end
+    read_topology = ThreadTeams.read_topology
+    mktempdir() do dir
+        root = fake(joinpath(dir, "a"); llc = 2)
+        @test read_topology([0, 1, 2, 5, 7], root) == ([0, 0, 2, 4, 6], [1, 1, 1, 2, 2], [10 21; 21 10])
+        # no shared cache reported (Ampere Altra): each CPU its own domain
+        root = fake(joinpath(dir, "b"); l3 = false)
+        @test read_topology([0, 1, 4], root)[1] == [0, 1, 4]
+        # emulated NUMA with overlapping nodes (Raspberry Pi 5): one node, LLCs kept
+        root = fake(joinpath(dir, "c"); ncpu = 4, llc = 4, nodes = [0:3 for _ in 1:8])
+        @test read_topology(0:3, root) == ([0, 0, 0, 0], ones(Int, 4), fill(10, 1, 1))
+        # without node information or distances
+        root = fake(joinpath(dir, "d"); nodes = [], distance = false)
+        @test read_topology([0, 4], root)[2:3] == ([1, 1], fill(10, 1, 1))
+        root = fake(joinpath(dir, "e"); distance = false, nodes = [0:1, 2:3, 4:7])
+        @test read_topology([0, 2, 4], root) == ([0, 0, 4], [1, 2, 3], [10 20 20; 20 10 20; 20 20 10])
+        # a CPU outside the nodes: one node
+        root = fake(joinpath(dir, "f"); nodes = [0:3])
+        @test read_topology([0, 4], root)[2] == [1, 1]
+        if Sys.islinux()
+            mask(cpus...) = [i - 1 in cpus for i in 1:8]
+            wvo = ThreadTeams.worker_victim_orders
+            root = fake(joinpath(dir, "g"); llc = 2)
+            vo = wvo([mask(c) for c in 0:7], root)
+            @test vo.order[1] == [2, 3, 4, 5, 6, 7, 8] && vo.nlocal[1] == 3
+            # unpinned, shared or missing masks, an unreadable tree: cyclic
+            @test wvo([mask(0:7...) for _ in 1:8], root) === ThreadTeams.CYCLIC_VICTIMS
+            @test wvo([mask(0), mask(0)], root) === ThreadTeams.CYCLIC_VICTIMS
+            @test wvo(nothing, root) === ThreadTeams.CYCLIC_VICTIMS
+            rm(joinpath(root, "cpu", "cpu1", "cache", "index3", "type"))
+            @test wvo([mask(c) for c in 0:7], root) === ThreadTeams.CYCLIC_VICTIMS
+        end
+    end
+end
