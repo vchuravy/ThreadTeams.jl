@@ -8,7 +8,7 @@
         if NW > 1
             # Idle workers keep spinning, except the one on our thread (it sleeps when we
             # become runnable again) and, rarely, one whose thread has another task to run
-            # (`other_work`): pass if every other worker is awake in one of five tries
+            # (`local_work`): pass if every other worker is awake in one of five tries
             pool = @atomic ThreadTeams.POOL.pool
             awake() = all(eachindex(pool.workers)) do k
                 k == get(pool.tid2worker, Threads.threadid(), 0) ||

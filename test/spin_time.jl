@@ -1,7 +1,7 @@
 # Chunk 1 (on the caller) takes much longer than the spin time; the workers must not sleep
 # while they wait for it. The `sleeping` flags are read from inside chunk 1, while the pool
 # is busy: a worker whose spin time counted from the end of its own chunk would be asleep
-# by then, while one that gives its thread to another task (`other_work`) or is still
+# by then, while one that yields to a sticky task (`local_work`) or is still
 # being woken is not a bug. (Read after the loop, the flags would also catch a worker that
 # the OS held across the end of the loop.) In a function, so that the second call compiles
 # nothing inside the loop.
@@ -30,6 +30,48 @@ end
         # harness, GC, libuv) is rare and does not repeat; one whose spin time counts from
         # the end of its own chunk is asleep in every run
         @test any(_ -> !any(sleeping_during_long_chunk1()), 1:5)
+    end
+end
+
+# Queue a task while chunk 1 runs. One worker runs it and resumes spinning
+# (`run_queued_task`); the others keep spinning. Chunk 1 outlasts the spin time, which
+# must still count from the region's end, even for the worker that ran the task. Return
+# whether the task ran, how many workers were awake when it was queued, and how many
+# of those are asleep at the end of chunk 1.
+function sleep_after_queued_task()
+    res = Ref((false, 0, 0))
+    tforeach(1:NW; scheduler = team) do c
+        if c == 1
+            pool = @atomic ThreadTeams.POOL.pool
+            skip = get(pool.tid2worker, Threads.threadid(), 0)
+            ks = [ThreadTeams.worker_for_chunk(c2, skip) for c2 in 2:NW]
+            asleep() = [@atomic(pool.sleepflags[k].sleeping) for k in ks]
+            t0 = time_ns()
+            while time_ns() - t0 < 50_000   # let the workers finish waking up
+            end
+            before = asleep()
+            t = Threads.@spawn :default nothing
+            t0 = time_ns()
+            while !istaskdone(t) && time_ns() - t0 < 10^9
+            end
+            t0 = time_ns()
+            while time_ns() - t0 < 3 * ThreadTeams.SPIN_NS[]
+            end
+            res[] = (istaskdone(t), count(.!before), count(asleep() .& .!before))
+        end
+    end
+    return res[]
+end
+
+@testset "a queued task does not put the workers to sleep" begin
+    if NW > 2 && ThreadTeams.HAS_MULTIQ
+        sleep_after_queued_task()   # compiles
+        runs = [sleep_after_queued_task() for _ in 1:20]
+        @test all(r -> r[1], runs)
+        # Require enough awake workers to make the sleep count meaningful.
+        @test sum(r -> r[2], runs) >= 10 * (NW - 1)
+        # In 1.2.0, every worker that saw the task slept: 4 of 7 on average, 52 of 63.
+        @test sum(r -> r[3], runs) <= 5
     end
 end
 
