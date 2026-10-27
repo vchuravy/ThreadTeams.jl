@@ -14,6 +14,7 @@
 using ThreadTeams
 using Printf
 using Statistics
+include("../record.jl")
 
 const SCHED = get(ENV, "STEAL_SCHED", "team")
 SCHED == "polyester" && @eval using Polyester
@@ -58,4 +59,7 @@ for w in (0, 100, 300, 1_000, 3_000, 10_000)
     @printf(
         "w = %6d ns: median %8.0f ns  mean %8.0f ns  stolen %5.1f%%\n", w, med, avg, 100rate
     )
+    record("steal", "$SCHED w=$(w)ns", "median_ns", med)
+    record("steal", "$SCHED w=$(w)ns", "mean_ns", avg)
+    record("steal", "$SCHED w=$(w)ns", "stolen_pct", 100rate)
 end
