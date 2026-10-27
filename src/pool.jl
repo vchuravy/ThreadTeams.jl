@@ -440,17 +440,58 @@ nworkers() = Threads.threadpoolsize(:default)
     return nothing
 end
 
-# Does this thread have another task to run? Then an idle worker sleeps at once so that
-# the task gets the thread. (Scheduler internals; without them, workers sleep only after
-# the spin time.)
-@inline function other_work()
-    @static if isdefined(Base, :workqueue_for) && isdefined(Base, :Partr) &&
-            isdefined(Base.Partr, :multiq_check_empty)
-        return !isempty(Base.workqueue_for(Threads.threadid())) ||
-            !Base.Partr.multiq_check_empty()
+# A task sticky to this thread (`local_work`) needs this worker to sleep. A shared task
+# (`queued_work`) needs only one worker to run it (`run_queued_task`); the others keep
+# spinning, avoiding wake-ups in the next region. Without these scheduler internals,
+# workers sleep only after the spin time.
+const HAS_WORKQUEUE = isdefined(Base, :workqueue_for)
+const HAS_MULTIQ = isdefined(Base, :Partr) && isdefined(Base.Partr, :multiq_check_empty) &&
+    isdefined(Base.Partr, :multiq_deletemin)
+
+@inline local_work() =
+    @static HAS_WORKQUEUE ? !isempty(Base.workqueue_for(Threads.threadid())) : false
+
+@inline queued_work() = @static HAS_MULTIQ ? !Base.Partr.multiq_check_empty() : false
+
+# Serialize queue pops so workers do not all race for the same task.
+mutable struct TaskTaker
+    const _pad0::PadBefore
+    @atomic taking::Bool
+    const _pad1::PadAfter
+end
+const TAKER = TaskTaker(pad_before(), false, pad_after())
+
+# Run a queued task on this thread until it yields, waits or ends; meanwhile, the worker
+# waits in this thread's sticky queue. Return whether a task ran. Like `trypoptask`, skip
+# tasks that are no longer runnable (abandoned tasks, Julia ≥ 1.14).
+@noinline function run_queued_task()
+    @static if HAS_MULTIQ
+        (@atomicreplace :acquire :monotonic TAKER.taking false => true).success || return false
+        t = try
+            pop_runnable_task()
+        finally
+            @atomic :release TAKER.taking = false
+        end
+        t === nothing && return false
+        # Pass the value supplied by `schedule(t, val)`, e.g. by a timer.
+        yield(t, t.result)
+        return true
     else
         return false
     end
+end
+
+function pop_runnable_task()
+    while true
+        t = Base.Partr.multiq_deletemin()
+        t === nothing && return nothing
+        t = t::Task
+        t._state === Base.task_state_runnable && return t
+        @static if isdefined(Base, :discard_stale_workqueue_task)
+            Base.discard_stale_workqueue_task(t)
+        end
+    end
+    return
 end
 
 # More Julia threads than CPUs they may run on, e.g. `-t N` on N cores with Julia ≥ 1.12
@@ -598,8 +639,8 @@ end
 end
 
 # Wait until `ws.cmd` is non-zero: spin for `SPIN_NS` after the end of the region (or while
-# a `parallel_phase` is active), then sleep on `ev`; sleep at once if another task could
-# run on this thread. `ran_chunk`: the worker comes from a chunk, whose region may still
+# a `parallel_phase` is active), then sleep on `ev`; sleep at once if a runnable task is
+# sticky to this thread. `ran_chunk`: the worker comes from a chunk, whose region may still
 # run; only then does a busy pool restart the spin time. A worker that no region uses
 # counts from the end of its last chunk or wake-up: with loops back to back the pool is
 # nearly always busy, and the worker the loops leave out (the one of the caller's thread
@@ -637,7 +678,16 @@ function wait_for_command(
                 pool_busy() ? (t0 = now) : (own_region = false)
             end
             spun_out = now - t0 > SPIN_NS[]
-            if (spun_out && PHASE[] == 0) || other_work()
+            sleepy = spun_out && PHASE[] == 0
+            lw = !sleepy && local_work()
+            if !sleepy && !lw && queued_work()
+                if run_queued_task()
+                    # Preserve `own_region`: this worker's region may still be running.
+                    spins = 0
+                    t0 = tstart = tyield = tevents = time_ns()
+                    continue
+                end
+            elseif sleepy || lw
                 # Re-check after announcing the sleep: either we see the command here, or
                 # the waker sees `sleeping` and notifies `ev`
                 @atomic flag.sleeping = true
