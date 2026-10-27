@@ -215,6 +215,13 @@ end
 # A thief scans all other blocks before retiring; a block passed earlier may be refilled.
 # The participant that refills it remains responsible for draining it. Each successful
 # claim or steal reserves at least one index, ensuring progress.
+#
+# Victim order only affects placement. With every worker pinned to its own CPU, thieves
+# scan the victims sharing their LLC, the rest of their NUMA node, then other nodes by
+# distance (`victim_orders`). They leave the node only after a pass over it found nothing
+# and return to it after each remote steal: stolen data was first touched near its owner.
+# Proximity is the executing worker's, so a block rescued by the caller uses the caller's
+# order, or cyclic order off the pool. Unpinned pools scan cyclically from `me + 1`.
 struct StealRanges{F}
     f::F
     blocks::Vector{RangeBlock}
@@ -344,9 +351,38 @@ const PROTECTED_PASSES = 3
     return nothing
 end
 
+# Steal from block `v` while it has work (`once`: one steal), each steal a quarter of
+# what is left: whether it found work, and the `steal_allowed` verdict.
+@inline function steal_all(j::StealRanges, me::Int, v::Int, once::Bool = false)
+    verdict = steal_allowed(j, v)
+    verdict == STEAL_YES || return false, verdict
+    found = false
+    while !ranges_stopped(j.state)
+        lo, hi = steal_from(j, me, v)
+        lo > hi && break
+        found = true
+        j.f(lo, hi)
+        run_own(j, me)   # what it republished, unless stolen meanwhile
+        once && break
+    end
+    return found, STEAL_YES
+end
+
 @inline function run_steal(j::StealRanges, me::Int)
-    st = j.state
     run_own(j, me)
+    victims = j.state.victims
+    # By the executing worker's proximity: a block rescued by an off-pool caller has none
+    x = caller_worker(j.pool)
+    if x == 0 || isempty(victims.order)
+        steal_cyclic(j, me)
+    else
+        steal_nearest(j, me, x, @inbounds(victims.order[x]), Int(@inbounds victims.nlocal[x]))
+    end
+    return nothing
+end
+
+@inline function steal_cyclic(j::StealRanges, me::Int)
+    st = j.state
     p = j.p
     retries = 0
     while true
@@ -354,21 +390,10 @@ end
         v = me
         for _ in 2:p
             v = v == p ? 1 : v + 1
-            verdict = steal_allowed(j, v)
-            if verdict != STEAL_YES
-                protected |= verdict == STEAL_NO
-                soon |= verdict == STEAL_SOON
-                continue
-            end
-            # Again from the same block while it has work: the next steal takes a
-            # quarter of what is left
-            while !ranges_stopped(st)
-                lo, hi = steal_from(j, me, v)
-                lo > hi && break
-                found = true
-                j.f(lo, hi)
-                run_own(j, me)   # what it republished, unless stolen meanwhile
-            end
+            f, verdict = steal_all(j, me, v)
+            found |= f
+            protected |= verdict == STEAL_NO
+            soon |= verdict == STEAL_SOON
         end
         ranges_stopped(st) && break
         # Rescan after successful steals and while an owner may become due. Retry
@@ -376,6 +401,44 @@ end
         # rather than polling until the deadline.
         if !found
             soon || (protected && (retries += 1) <= PROTECTED_PASSES) || break
+            j.pool.oversubscribed ? os_yield() : cpu_pause()
+        end
+    end
+    return nothing
+end
+
+# Scan `order` (executing worker `x`'s victims, the first `nlocal` on its node) as the
+# cyclic scan does, but leave the node only after a pass over it found nothing, and
+# return to it after each remote steal, as its blocks may have been refilled. A full scan, which ends in rescanning
+# (owners that may become due), retrying protected blocks or retiring, is a fruitless
+# local pass and then a remote one.
+@inline function steal_nearest(j::StealRanges, me::Int, x::Int, order::Vector{Int32}, nlocal::Int)
+    st = j.state
+    p = j.p
+    retries = 0
+    remote = protected = soon = false
+    while true
+        remote || (protected = soon = false)
+        found = false
+        for i in (remote ? ((nlocal + 1):length(order)) : (1:nlocal))
+            v = Int(@inbounds order[i])
+            # Executing a rescued block, `x`'s own block takes its place
+            v == me && (v = x)
+            v > p && continue
+            f, verdict = steal_all(j, me, v, remote)
+            found |= f
+            protected |= verdict == STEAL_NO
+            soon |= verdict == STEAL_SOON
+            remote && f && break
+        end
+        ranges_stopped(st) && break
+        if found
+            remote = false
+        elseif !remote && nlocal < length(order)
+            remote = true
+        else
+            soon || (protected && (retries += 1) <= PROTECTED_PASSES) || break
+            remote = false
             j.pool.oversubscribed ? os_yield() : cpu_pause()
         end
     end
@@ -403,13 +466,19 @@ are counted by `ThreadTeams.stolen_chunks()`.
   steal from other blocks' tails. Unstarted blocks get the same startup protection as
   above. This balances uneven work, but execution placement depends on timing: a stalled
   owner can lose most of its remaining block. Already running calls cannot be stolen.
+  On Linux with Julia ≥ 1.11, when each worker is pinned to a CPU of its own,
+  participants prefer victims sharing their last-level cache, then their NUMA node, and
+  steal from other nodes only once their node seems out of work; otherwise they try
+  victims in cyclic order.
   `grain` bounds each call's range length; `0` currently selects an eighth of a block.
   For `n ≥ 2^31` it runs in static mode, ignoring `grain`.
 
 Fixed ownership matches the preferred placement of `Threads.@threads :static` for the
 same `n` and `p`. NUMA first-touch locality also requires thread affinity (e.g.
-`ThreadPinning.pinthreads(:cores)` or `:numa`). Rescue, stealing, serial fallback and
-migration of a non-sticky caller after a yield can change execution placement.
+`ThreadPinning.pinthreads(:cores)` or `:numa`). Pin before the first parallel loop, or
+call `ThreadTeams.shutdown!()` after pinning: the topology is read when the workers start.
+Rescue, stealing, serial fallback and migration of a non-sticky caller after a yield can
+change execution placement.
 
 For nonempty input, run `f(1, n)` serially on the caller when `p == 1`, the team is busy,
 the call is nested in a team loop, a `Threads.@threads` loop is active, or during
