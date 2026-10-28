@@ -46,6 +46,13 @@ function on_thread(f, tid)
     return fetch(t)
 end
 
+# Install victim orders between regions; returns the previous ones
+function set_victim_orders!(pool, victims)
+    old = pool.ranges.victims
+    pool.ranges.victims = victims
+    return old
+end
+
 # Spin until cond() or timeout, with safepoints so allocating threads can trigger GC.
 function spin_until(cond, timeout)
     t = time()
@@ -328,6 +335,29 @@ end
             t0 = time_ns()
             foreach_range((lo, hi) -> nothing, 100NW; schedule = :steal)
             @test all(k -> (s = @atomic st.blocks[k].seen; s == 0 || s >= t0), 1:NW)
+        end
+    end
+
+    @testset "nearest victims" begin
+        # Thief 1 with local victim 2 and remote victims 3 and 4, one index each. The
+        # remote callback refills block 2: after a remote steal (and its republished
+        # rest) the thief goes back to its node before the next remote victim.
+        pool = @atomic ThreadTeams.POOL.pool
+        if pool !== nothing
+            st = ThreadTeams.RangeState(4)
+            calls = Int[]
+            pack = ThreadTeams.pack_range
+            j = ThreadTeams.StealRanges(
+                (lo, hi) -> begin
+                    push!(calls, lo)
+                    lo == 201 && (@atomic st.blocks[2].word = pack(true, 100, 101))
+                end, st.blocks, 1, 0, 4, 0, 10, UInt64(0), st, pool
+            )
+            for (k, (lo, hi)) in enumerate([(0, 0), (100, 100), (200, 201), (300, 301)])
+                @atomic st.blocks[k].word = pack(true, lo, hi)
+            end
+            ThreadTeams.steal_nearest(j, 1, 1, Int32[2, 3, 4], 1)
+            @test calls == [201, 101, 301]
         end
     end
 
@@ -636,6 +666,66 @@ end
                 finally
                     stop[] = true
                     foreach(wait, hogs)
+                end
+            end
+        end
+    end
+
+    @testset "victim order" begin
+        # Blocks 1:NW-1 hold their first call until the last block's owner, done with its
+        # own block, steals: its first victim. Only the order matters, so rescues of other
+        # blocks are fine (with more threads than CPUs every region has one); an attempt
+        # counts if worker NW ran its own block and stole.
+        function first_victim()
+            n = 64NW
+            bs = blocks(n, NW)
+            started = Threads.Atomic{Int}(0)
+            victim = Threads.Atomic{Int}(0)
+            foreach_range(n; schedule = :steal, grain = 1) do lo, hi
+                k = block_of(lo, n, NW)
+                if Threads.threadid() == WTIDS[NW]
+                    if k != NW
+                        Threads.atomic_cas!(victim, 0, k)
+                    elseif lo == bs[NW][1]
+                        spin_until(() -> started[] == NW - 1, 2)
+                    end
+                elseif lo == bs[k][1]
+                    Threads.atomic_add!(started, 1)
+                    spin_until(() -> victim[] != 0, 2)
+                end
+                return nothing
+            end
+            return started[] == NW - 1 ? victim[] : 0
+        end
+        function first_victims()
+            vs = Int[]
+            for _ in 1:10
+                v = first_victim()
+                v != 0 && push!(vs, v)
+                length(vs) == 3 && break
+            end
+            isempty(vs) && @info "victim order: the last worker never ran its block and stole"
+            return vs
+        end
+        if NW >= 3
+            ThreadTeams.parallel_phase() do
+                # The last two workers on one node: the thief tries its neighbour first
+                node = [k >= NW - 1 ? 2 : 1 for k in 1:NW]
+                vo = ThreadTeams.victim_orders(node, node, [10 20; 20 10])
+                pool = @atomic ThreadTeams.POOL.pool
+                old = set_victim_orders!(pool, ThreadTeams.CYCLIC_VICTIMS)
+                try
+                    # Cyclic order takes block 1 first
+                    vs = first_victims()
+                    isempty(vs) ? (@test_skip false) : (@test all(==(1), vs))
+                    set_victim_orders!(pool, vo)
+                    vs = first_victims()
+                    isempty(vs) ? (@test_skip false) : (@test all(==(NW - 1), vs))
+                    for p in 2:NW
+                        @test tiles(record_ranges(10^4; threads = p, schedule = :steal, grain = 7), 10^4)
+                    end
+                finally
+                    set_victim_orders!(pool, old)
                 end
             end
         end

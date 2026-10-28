@@ -39,8 +39,10 @@ to watch:
 
 - Pin before the first parallel loop, or call `ThreadTeams.shutdown!()` after pinning:
   whether threads share CPUs (and idle workers must give their CPU to other threads now
-  and then) is checked when the workers are started. Julia 1.10 can not query the
-  affinity of other threads; there, a pinned calling thread counts as oversubscription.
+  and then) is checked when the workers are started, as is the cache and NUMA topology
+  that `foreach_range(...; schedule = :steal)` uses on Linux to steal from nearby
+  workers first. Julia 1.10 can not query the affinity of other threads; there, a pinned
+  calling thread counts as oversubscription, and stealing ignores the topology.
 - With Julia ≥ 1.12, `julia -t N` adds an interactive thread, which is the main thread.
   `pinthreads(:cores)` pins only the `:default` threads, and the OS may then run the
   unpinned main thread (which runs chunks of the loops it starts) on the CPU of a pinned

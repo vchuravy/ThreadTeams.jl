@@ -208,10 +208,12 @@ mutable struct RangeState
     const blocks::Vector{RangeBlock}
     # Static mode's dispatcher-only first-awake timestamps; zero means not observed awake.
     const seen::Vector{UInt64}
+    # Thieves' victim orders (`worker_victim_orders`); replaced only between regions
+    victims::VictimOrders
 end
-RangeState(nw::Int) = RangeState(
+RangeState(nw::Int, victims::VictimOrders = CYCLIC_VICTIMS) = RangeState(
     ntuple(_ -> 0, Val(PAD_BEFORE - 1)), nothing, false, pad_after(), false, pad_after(),
-    [RangeBlock() for _ in 1:nw], zeros(UInt64, nw)
+    [RangeBlock() for _ in 1:nw], zeros(UInt64, nw), victims
 )
 
 # The dispatcher stores the chunk function into a slot of each worker (`worker_slots`)
@@ -501,12 +503,13 @@ end
 # (which adds an interactive thread), `taskset`, a cgroup CPU quota, or threads pinned
 # (e.g. with ThreadPinning.jl) so that several of them share a CPU. Checked when the pool is
 # created (`ThreadTeams.shutdown!()` makes the next loop check again).
-function is_oversubscribed()
-    tids = vcat(Threads.threadpooltids(:interactive), Threads.threadpooltids(:default))
+function is_oversubscribed(
+        tids = vcat(Threads.threadpooltids(:interactive), Threads.threadpooltids(:default)),
+        masks = thread_affinity_masks(tids)
+    )
     nt = length(tids)
     # CPUs of the calling thread's affinity mask, limited by the cgroup CPU quota
     navail = Int(ccall(:uv_available_parallelism, Cuint, ()))
-    masks = thread_affinity_masks(tids)
     masks === nothing && return nt > navail
     oversubscribed_masks(masks) && return true
     # The quota is only known through `uv_available_parallelism`, which also counts the
@@ -787,12 +790,15 @@ function Pool()
         tid2worker[tid] = k
     end
     nw <= CMD_MASK || error("ThreadTeams supports at most $CMD_MASK threads")
+    alltids = vcat(Threads.threadpooltids(:interactive), tids)
+    masks = thread_affinity_masks(alltids)
+    victims = worker_victim_orders(masks === nothing ? nothing : masks[(end - nw + 1):end])
     pool = Pool(
         nothing, [WorkerState() for _ in 1:nw],
         [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw],
         pad_before(), false, pad_after(),
         tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
-        Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed(), 0, RangeState(nw)
+        Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed(alltids, masks), 0, RangeState(nw, victims)
     )
     # A new task inherits its creator's dynamic scope. The workers get none, so they
     # neither keep the first caller's scope alive nor miss the fast path of
