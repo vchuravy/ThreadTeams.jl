@@ -50,6 +50,21 @@ const RANGE_PARK_S = 10.0e-6
 @inline rescue_due(asleep::Bool, seen::UInt64, now::UInt64, deadline::UInt64) =
     now >= deadline || (!asleep && seen != 0 && now - seen >= RANGE_AWAKE_NS)
 
+# The same rule for the owner of steal block `b` with its command pending, shared by
+# thieves and the dispatcher: `b.seen` is the first awake observation of the region,
+# never reset before `init_blocks!`, so waits do not renew; the owner must still be awake.
+# Another observer's `seen` may follow our `now`, which is then not due yet.
+@inline function owner_due(b::RangeBlock, asleep::Bool, now::UInt64, deadline::UInt64)
+    now >= deadline && return true
+    asleep && return false
+    seen = @atomic :monotonic b.seen
+    if seen == 0
+        old, ok = @atomicreplace :monotonic :monotonic b.seen UInt64(0) => now
+        seen = ok ? now : old
+    end
+    return seen <= now && now - seen >= RANGE_AWAKE_NS
+end
+
 # Wake all sleeping workers; their usual child wake-ups remain harmless.
 @inline function wake_all(pool::Pool, n::Int, skip::Int, base::Int)
     for chunk in 2:n
@@ -66,8 +81,11 @@ end
     )
     st = job.state
     seen = st.seen
-    for chunk in 2:n
-        @inbounds seen[worker_for_chunk(chunk, skip)] = 0
+    # Steal jobs use their blocks' clocks
+    if !(job isa StealRanges)
+        for chunk in 2:n
+            @inbounds seen[worker_for_chunk(chunk, skip)] = 0
+        end
     end
     spin = pool.oversubscribed ? RANGE_SPIN_OVERSUBSCRIBED_NS : RANGE_SPIN_NS
     tstart = UInt64(0)
@@ -87,9 +105,15 @@ end
             (@atomic :monotonic ws.cmd) == cmd || continue
             asleep = @atomic :monotonic (@inbounds pool.sleepflags[k]).sleeping
             now == 0 && (now = time_ns())
-            t = asleep ? UInt64(0) : (@inbounds(seen[k]) == 0 ? now : @inbounds(seen[k]))
-            @inbounds seen[k] = t
-            if rescue_due(asleep, t, now, job.deadline)
+            if job isa StealRanges
+                # Chunk `chunk` runs block `k`
+                due = owner_due(@inbounds(job.blocks[k]), asleep, now, job.deadline)
+            else
+                t = asleep ? UInt64(0) : (@inbounds(seen[k]) == 0 ? now : @inbounds(seen[k]))
+                @inbounds seen[k] = t
+                due = rescue_due(asleep, t, now, job.deadline)
+            end
+            if due
                 (@atomicreplace :monotonic ws.cmd cmd => 0).success || continue
                 wake_children(pool, cmd)
                 copies && clear_slot!(@inbounds wslots[k])
@@ -221,7 +245,9 @@ const RANGE_STARTED = UInt64(1) << 63
 @inline function init_blocks!(blocks::Vector{RangeBlock}, q::Int, r::Int, p::Int)
     for k in 1:p
         lo, hi = block_bounds(q, r, k)
-        @atomic :monotonic (@inbounds blocks[k]).word = pack_range(false, lo - 1, hi)
+        b = @inbounds blocks[k]
+        @atomic :monotonic b.word = pack_range(false, lo - 1, hi)
+        @atomic :monotonic b.seen = UInt64(0)
     end
     return nothing
 end
@@ -265,25 +291,31 @@ end
 @inline block_started(j::StealRanges, v::Int) =
     ((@atomic :monotonic (@inbounds j.blocks[v]).word) & RANGE_STARTED) != 0
 
-# Started blocks are freely stealable. For unstarted blocks, use the rescue rule:
-# watch awake workers with pending commands for RANGE_AWAKE_NS; protect sleeping workers,
-# claimed commands and the caller's block until the deadline.
+# `steal_allowed` verdicts: take; wait for an awake owner to claim or become due;
+# protected (owner asleep or claimed, or the caller's block) until the deadline
+const STEAL_YES = 0
+const STEAL_SOON = 1
+const STEAL_NO = 2
+
+# The verdict for an unstarted, nonempty block `b` whose owner's command is `pending`
+@inline function unstarted_verdict(
+        b::RangeBlock, pending::Bool, asleep::Bool, now::UInt64, deadline::UInt64
+    )
+    pending || return now >= deadline ? STEAL_YES : STEAL_NO
+    owner_due(b, asleep, now, deadline) && return STEAL_YES
+    return asleep ? STEAL_NO : STEAL_SOON
+end
+
+# Started and empty blocks are freely stealable; others follow the rescue rule. No
+# waiting here: a private 2 µs wait per call and block made loaded launches take ~1 ms.
 @inline function steal_allowed(j::StealRanges, v::Int)
-    block_started(j, v) && return true
+    b = @inbounds j.blocks[v]
+    started, lo, hi = unpack_range(@atomic :monotonic b.word)
+    (started || lo >= hi) && return STEAL_YES
     pool = j.pool
-    seen = UInt64(0)
-    while true
-        now = time_ns()
-        pending = (@atomic :monotonic (@inbounds pool.workers[v]).cmd) > 0
-        asleep = @atomic :monotonic (@inbounds pool.sleepflags[v]).sleeping
-        awake_pending = pending && !asleep
-        awake_pending && seen == 0 && (seen = now)
-        rescue_due(!awake_pending, seen, now, j.deadline) && return true
-        awake_pending || return false
-        cpu_pause()
-        block_started(j, v) && return true
-    end
-    return
+    pending = (@atomic :monotonic (@inbounds pool.workers[v]).cmd) > 0
+    asleep = @atomic :monotonic (@inbounds pool.sleepflags[v]).sleeping
+    return unstarted_verdict(b, pending, asleep, time_ns(), j.deadline)
 end
 
 function (j::StealRanges)(chunk::Int)
@@ -298,7 +330,7 @@ function (j::StealRanges)(chunk::Int)
     return nothing
 end
 
-# Retry protected blocks briefly before retiring.
+# Retry protected (`STEAL_NO`) blocks briefly before retiring.
 const PROTECTED_PASSES = 3
 
 # Run the participant's own block, by owner rules
@@ -318,12 +350,14 @@ end
     p = j.p
     retries = 0
     while true
-        found = protected = false
+        found = protected = soon = false
         v = me
         for _ in 2:p
             v = v == p ? 1 : v + 1
-            if !steal_allowed(j, v)
-                protected = true
+            verdict = steal_allowed(j, v)
+            if verdict != STEAL_YES
+                protected |= verdict == STEAL_NO
+                soon |= verdict == STEAL_SOON
                 continue
             end
             # Again from the same block while it has work: the next steal takes a
@@ -337,10 +371,11 @@ end
             end
         end
         ranges_stopped(st) && break
-        # Rescan after successful steals. Retry protected blocks briefly, then let their
-        # owners or the dispatcher handle them rather than polling until the deadline.
+        # Rescan after successful steals and while an owner may become due. Retry
+        # protected blocks briefly, then let their owners or the dispatcher handle them
+        # rather than polling until the deadline.
         if !found
-            (protected && (retries += 1) <= PROTECTED_PASSES) || break
+            soon || (protected && (retries += 1) <= PROTECTED_PASSES) || break
             j.pool.oversubscribed ? os_yield() : cpu_pause()
         end
     end

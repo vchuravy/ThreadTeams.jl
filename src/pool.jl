@@ -182,15 +182,18 @@ mutable struct ChunkCounter
 end
 ChunkCounter() = ChunkCounter(pad_before(), 0, pad_after())
 
-# Cache-line-separated packed range (see `pack_range`). UInt64 also on 32-bit systems:
-# Julia aligns atomic fields to their size. i686 uses SSE2 loads/stores and lock cmpxchg8b
-# (checked on Julia 1.10/1.12); ARMv7 should use ldrexd/strexd (not verified).
+# Cache-line-separated packed range (see `pack_range`) and its owner's rescue clock
+# (`owner_due`), on one line. UInt64 also on 32-bit systems: Julia aligns atomic fields to
+# their size. i686 uses SSE2 loads/stores and lock cmpxchg8b (checked on Julia 1.10/1.12);
+# ARMv7 should use ldrexd/strexd (not verified).
+const RANGE_PAD = CACHE_LINE ÷ sizeof(Int) - 2 * (sizeof(UInt64) ÷ sizeof(Int))
 mutable struct RangeBlock
-    const _pad0::PadBefore
+    const _pad0::NTuple{RANGE_PAD, Int}
     @atomic word::UInt64
+    @atomic seen::UInt64
     const _pad1::PadAfter
 end
-RangeBlock() = RangeBlock(pad_before(), UInt64(0), pad_after())
+RangeBlock() = RangeBlock(ntuple(_ -> 0, Val(RANGE_PAD)), UInt64(0), UInt64(0), pad_after())
 
 # Per-pool range state: error/stop share a read-only line until failure; `active` has
 # its own line, read by idle workers and set/cleared by the dispatcher. Steal blocks
@@ -203,7 +206,7 @@ mutable struct RangeState
     @atomic active::Bool
     const _pad2::PadAfter
     const blocks::Vector{RangeBlock}
-    # Dispatcher-only first-awake timestamps; zero means not observed awake.
+    # Static mode's dispatcher-only first-awake timestamps; zero means not observed awake.
     const seen::Vector{UInt64}
 end
 RangeState(nw::Int) = RangeState(
