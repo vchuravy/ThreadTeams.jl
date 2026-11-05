@@ -201,7 +201,7 @@ end
         if pool !== nothing && NW >= 4
             st = pool.ranges
             j = ThreadTeams.StealRanges(
-                (lo, hi) -> nothing, st.blocks, 25, 0, 4, 0, 3, UInt64(0), st, pool
+                (lo, hi) -> nothing, st.blocks, 25, 0, 4, 0, 3, UInt64(0), false, st, pool
             )
             word(k) = ThreadTeams.unpack_range(@atomic st.blocks[k].word)
             ThreadTeams.init_blocks!(st.blocks, 25, 0, 4)
@@ -293,7 +293,7 @@ end
             calls = Tuple{Int, Int}[]
             j = TT.StealRanges(
                 (lo, hi) -> (push!(calls, (lo, hi)); nothing), st.blocks, 50, 0, 2, 1, 10,
-                deadline, st, pool
+                deadline, false, st, pool
             )
             TT.init_blocks!(st.blocks, 50, 0, 2)
             @atomic st.blocks[1].word = TT.pack_range(true, 50, 50)
@@ -351,7 +351,7 @@ end
                 (lo, hi) -> begin
                     push!(calls, lo)
                     lo == 201 && (@atomic st.blocks[2].word = pack(true, 100, 101))
-                end, st.blocks, 1, 0, 4, 0, 10, UInt64(0), st, pool
+                end, st.blocks, 1, 0, 4, 0, 10, UInt64(0), false, st, pool
             )
             for (k, (lo, hi)) in enumerate([(0, 0), (100, 100), (200, 201), (300, 301)])
                 @atomic st.blocks[k].word = pack(true, lo, hi)
@@ -873,6 +873,38 @@ end
                 @test (@atomic st.err) === nothing
                 @test !(@atomic ThreadTeams.POOL.pool).failed
                 @test tiles(record_ranges(1000; schedule = mode), 1000)
+            end
+        end
+    end
+
+    @testset "isolate" begin
+        # A task queued on the caller's thread runs while the caller waits for the workers,
+        # unless `isolate`. The caller's calls (own, rescued or stolen) wait until a worker
+        # runs one, which takes long enough for the caller to reach its waits.
+        if NW > 1
+            tid = Threads.threadid()
+            for mode in (:static, :steal), isolate in (false, true)
+                ran = Threads.Atomic{Bool}(false)
+                started = Threads.Atomic{Bool}(false)
+                t = Task(() -> (ran[] = true))
+                t.sticky = true
+                ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1)
+                schedule(t)
+                foreach_range(4NW; schedule = mode, isolate) do lo, hi
+                    if Threads.threadid() == tid
+                        t0 = time()
+                        while !started[] && time() - t0 < 10
+                            GC.safepoint()
+                        end
+                    else
+                        started[] = true
+                        Libc.systemsleep(0.05)
+                    end
+                end
+                @test started[]
+                @test ran[] == !isolate
+                wait(t)
+                @test ran[]
             end
         end
     end
