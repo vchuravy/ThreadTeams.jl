@@ -1003,7 +1003,13 @@ end
 # this thread can make progress. Returns `false` if the worker died with its command set
 # (`dead_worker_error`); the caller then waits for the other workers before it throws.
 # `give_cpu`: yield CPU time each spin on oversubscribed range regions (`wait_workers`).
-@inline function wait_idle(pool::Pool, k::Int, give_cpu::Bool = false)
+# `isolate`: do not switch tasks (`foreach_range`) while the caller is still on the thread
+# of worker `skip` (`caller_worker` when the region started). A call of `f` that yielded
+# may have moved it to a participant's thread; that participant can then only progress if
+# we yield, also when we wait for another one that depends on it.
+@inline function wait_idle(
+        pool::Pool, k::Int, give_cpu::Bool = false, isolate::Bool = false, skip::Int = 0
+    )
     ws = @inbounds pool.workers[k]
     spins = 0
     while (@atomic :acquire ws.cmd) != 0
@@ -1012,11 +1018,11 @@ end
             # Fallback of the handshake in `wake_chunk` (relaxed load): wake the worker if
             # it sleeps with a pending command
             @atomic(:monotonic, (@inbounds pool.sleepflags[k]).sleeping) &&
-                notify(@inbounds pool.events[k])
+                wake_worker(pool, k, isolate)
             # A worker task dies only by an exception thrown into it from outside (an
             # interrupt); with its command still set, the region would wait forever
             istaskdone(@inbounds pool.tasks[k]) && return false
-            yield()
+            (isolate && caller_worker(pool) == skip) || yield()
         else
             give_cpu ? os_yield() : cpu_pause()
             GC.safepoint()
@@ -1045,11 +1051,33 @@ end
 
 # Wake the worker of chunk `chunk` if it sleeps with this chunk still pending (`base`: the
 # command without the chunk index, see `cmd_base`)
-@inline function wake_chunk(pool::Pool, chunk::Int, skip::Int, base::Int)
+@inline function wake_chunk(pool::Pool, chunk::Int, skip::Int, base::Int, isolate::Bool = false)
     k = worker_for_chunk(chunk, skip)
     if (@atomic (@inbounds pool.sleepflags[k]).sleeping) &&
             (@atomic (@inbounds pool.workers[k]).cmd) == base | chunk
-        notify(@inbounds pool.events[k])
+        wake_worker(pool, k, isolate)
+    end
+    return nothing
+end
+
+# `isolate`: without switching tasks. `notify` waits for the event's lock when another
+# task holds it, which switches tasks; take the (reentrant) lock without waiting first, so
+# that `notify` gets it at once. No task switches while it holds the lock (`wait` releases
+# it first), so the holder releases it without our yielding.
+@inline function wake_worker(pool::Pool, k::Int, isolate::Bool)
+    ev = @inbounds pool.events[k]
+    isolate ? notify_isolated(ev) : notify(ev)
+    return nothing
+end
+@noinline function notify_isolated(ev::Base.Event)
+    cond = ev.notify
+    while !trylock(cond)
+        cpu_pause()
+    end
+    try
+        notify(ev)
+    finally
+        unlock(cond)
     end
     return nothing
 end
@@ -1064,14 +1092,14 @@ end
 # it sleeps; for a worker, the full barrier of its sc claim does the same on x86 and
 # AArch64, though not in the C11 model (tla/README.md). A lost wake-up costs no
 # correctness: the dispatcher steals the chunk, and `wait_idle` re-notifies.
-@inline function wake_children(pool::Pool, cmd::Int)
+@inline function wake_children(pool::Pool, cmd::Int, isolate::Bool = false)
     chunk = cmd_chunk(cmd)
     n = cmd_nchunks(cmd)
     skip = cmd_skip(cmd)
     base = cmd & ~CMD_MASK
     c = 2chunk
-    c <= n && wake_chunk(pool, c, skip, base)
-    c + 1 <= n && wake_chunk(pool, c + 1, skip, base)
+    c <= n && wake_chunk(pool, c, skip, base, isolate)
+    c + 1 <= n && wake_chunk(pool, c + 1, skip, base, isolate)
     return nothing
 end
 
@@ -1093,6 +1121,8 @@ end
     copies = own_slots(F)
     clears = copies && DISPATCHER_CLEARS[]
     base = cmd_base(n, skip, has_scope)
+    # Never switch tasks (`foreach_range`); a constant `false` for other jobs
+    isolate = f isa RangeJob && f.isolate
     # Whether every worker of the region is idle (also when a chunk threw), and whether the
     # workers' slots are empty: both until the first command goes out. `stored`: whether
     # the chunk function is in `slot`.
@@ -1132,10 +1162,11 @@ end
             # Normally idle (an interrupted region waits for its workers); detects a dead one.
             # Relaxed first: the last region's wait for the worker already acquired its
             # results, so only a worker still busy needs `wait_idle`'s acquire loop
-            if (@atomic :monotonic (@inbounds pool.workers[k]).cmd) != 0 && !wait_idle(pool, k)
+            if (@atomic :monotonic (@inbounds pool.workers[k]).cmd) != 0 &&
+                    !wait_idle(pool, k, false, isolate, skip)
                 # Take back the chunks already handed out before giving up
                 cancel_chunks(pool, chunk + 1, n, skip, base, wslots, copies)
-                wait_workers(pool, chunk + 1, n, skip)
+                wait_workers(pool, chunk + 1, n, skip, isolate)
                 drained = true
                 dead_worker_error(k)
             end
@@ -1154,7 +1185,7 @@ end
         # Range jobs wake all workers; other jobs use the tree. If chunk 1 throws,
         # `finally` cancels pending chunks and drains started ones. RangeJob branches
         # resolve at compile time, preserving other jobs' dispatch paths.
-        f isa RangeJob ? wake_all(pool, n, skip, base) : wake_children(pool, base | 1)
+        f isa RangeJob ? wake_all(pool, n, skip, base, isolate) : wake_children(pool, base | 1)
         run_chunk(slot, 1)   # the workers' code, see `run_chunk`
         # Rescue unclaimed participants, allowing range owners time to wake.
         if f isa RangeJob
@@ -1163,7 +1194,9 @@ end
             steal_chunks(pool, slot, n, skip, base, wslots, copies)
         end
         # An oversubscribed range dispatcher must yield CPU time to its workers.
-        wait_workers(pool, 2, n, skip, wslots, clears, f isa RangeJob && pool.oversubscribed)
+        wait_workers(
+            pool, 2, n, skip, wslots, clears, f isa RangeJob && pool.oversubscribed, isolate
+        )
         drained = cleared = true
         # Acquired by `wait_workers`. Check job-level failures, then participant failures
         # recorded by `run_commands`.
@@ -1298,8 +1331,8 @@ end
 
 # Wait until the workers of chunks `from:n` are idle. A dead worker is reported only once
 # the others have finished, since the region's slot and buffers are released afterwards.
-@inline function wait_workers(pool::Pool, from, n, skip)
-    return wait_workers(pool, from, n, skip, worker_slot_vector(Nothing), false)
+@inline function wait_workers(pool::Pool, from, n, skip, isolate::Bool = false)
+    return wait_workers(pool, from, n, skip, worker_slot_vector(Nothing), false, false, isolate)
 end
 # The same, emptying the slot of each worker (`copies`) as soon as the worker is idle: the
 # stores overlap the wait for the others, so that only the last worker's is on the
@@ -1307,12 +1340,13 @@ end
 # `give_cpu` prevents an oversubscribed dispatcher from starving a worker: on Orin
 # with `-t 6,1`, spinning stretched a 20 µs range to 2 ms.
 @inline function wait_workers(
-        pool::Pool, from, n, skip, wslots, copies::Bool, give_cpu::Bool = false
+        pool::Pool, from, n, skip, wslots, copies::Bool, give_cpu::Bool = false,
+        isolate::Bool = false
     )
     dead = 0
     for chunk in from:n
         k = worker_for_chunk(chunk, skip)
-        if wait_idle(pool, k, give_cpu)
+        if wait_idle(pool, k, give_cpu, isolate, skip)
             copies && clear_slot!(@inbounds wslots[k])
         else
             dead = k
@@ -1328,11 +1362,12 @@ end
     f isa GreedyJob && (@atomic :monotonic f.counter.next = GREEDY_FAILED)
     f isa RangeJob && (@atomic :monotonic f.state.stop = true)
     cancel_chunks(pool, 2, n, skip, base, wslots, copies)
+    isolate = f isa RangeJob && f.isolate
     for chunk in 2:n
         k = worker_for_chunk(chunk, skip)
         while true
             try
-                wait_idle(pool, k)
+                wait_idle(pool, k, false, isolate, skip)
                 break
             catch
             end

@@ -66,16 +66,17 @@ const RANGE_PARK_S = 10.0e-6
 end
 
 # Wake all sleeping workers; their usual child wake-ups remain harmless.
-@inline function wake_all(pool::Pool, n::Int, skip::Int, base::Int)
+@inline function wake_all(pool::Pool, n::Int, skip::Int, base::Int, isolate::Bool)
     for chunk in 2:n
-        wake_chunk(pool, chunk, skip, base)
+        wake_chunk(pool, chunk, skip, base, isolate)
     end
     return nothing
 end
 
 # Rescue pending chunks once `rescue_due`, waking their children on their behalf.
 # On failure, cancel pending commands; leave dead-worker reporting to `wait_workers`.
-# Yield and park after bounded spinning. Placement was captured before any task migration.
+# Yield and park after bounded spinning (only park when `isolate`). Placement was captured
+# before any task migration.
 @noinline function rescue_ranges(
         pool::Pool, job, slot, n::Int, skip::Int, base::Int, wslots, copies::Bool
     )
@@ -115,7 +116,7 @@ end
             end
             if due
                 (@atomicreplace :monotonic ws.cmd cmd => 0).success || continue
-                wake_children(pool, cmd)
+                wake_children(pool, cmd, job.isolate)
                 copies && clear_slot!(@inbounds wslots[k])
                 @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + 1
                 # Range jobs catch callback failures.
@@ -141,7 +142,7 @@ end
                 (@atomic :monotonic (@inbounds pool.workers[k]).cmd) == base | chunk &&
                     istaskdone(@inbounds pool.tasks[k]) && return nothing
             end
-            yield()
+            job.isolate || yield()
             Libc.systemsleep(RANGE_PARK_S)
         end
     end
@@ -188,6 +189,7 @@ struct StaticRanges{F}
     p::Int
     skip::Int
     deadline::UInt64   # `range_deadline`
+    isolate::Bool
     state::RangeState
     pool::Pool
 end
@@ -231,6 +233,7 @@ struct StealRanges{F}
     skip::Int
     grain::Int
     deadline::UInt64
+    isolate::Bool
     state::RangeState
     pool::Pool
 end
@@ -447,7 +450,7 @@ end
 
 """
     ThreadTeams.foreach_range(f, n::Integer; threads::Integer = ThreadTeams.nworkers(),
-        schedule::Symbol = :static, grain::Integer = 0)
+        schedule::Symbol = :static, grain::Integer = 0, isolate::Bool = false)
 
 Call `f(first, last)` on disjoint, nonempty inclusive ranges covering `1:n` exactly once.
 No calls for `n == 0`. Uses at most `p = min(threads, n, nworkers())` participants, capped
@@ -485,6 +488,16 @@ the call is nested in a team loop, a `Threads.@threads` loop is active, or durin
 precompilation. This ignores placement, schedule and grain; `threads = 1` does not
 select worker 1.
 
+While it waits for the other participants, the caller lets tasks queued on its thread
+run, as `Threads.@threads` does. With `isolate = true` it runs no other task between
+its own calls of `f` (it spins and parks its thread instead, and may still rescue blocks):
+tasks queued on its thread wait for the loop to end. This keeps the caller on its thread
+and the thread's state as the caller left it, e.g. an interrupt deferred with
+`disable_sigint`: Julia up to 1.13 delivers it to whichever task runs on thread 1 next,
+which could be another task or a worker, and the caller would never see it. This holds
+only while `f` does not yield: a call that does lets other tasks run, and may move the
+caller to another thread.
+
 Calls run in the caller's dynamic scope and world age. Concurrent calls do not share a
 thread unless they yield. After a failure, participants stop once they observe it;
 concurrent calls may still start. All started calls finish before the first recorded
@@ -511,7 +524,7 @@ end
 """
 function foreach_range(
         f::F, n::Integer; threads::Integer = nworkers(), schedule::Symbol = :static,
-        grain::Integer = 0
+        grain::Integer = 0, isolate::Bool = false
     ) where {F}
     # Leave headroom for block-bound arithmetic.
     0 <= n <= typemax(Int) >> 2 ||
@@ -533,14 +546,14 @@ function foreach_range(
     if steal && n <= STEAL_MAX_N
         # At most the longest block
         g = grain == 0 ? cld(n ÷ p, 8) : Int(min(grain, cld(n, p)))
-        run_steal_ranges(f, n, p, g)
+        run_steal_ranges(f, n, p, g, isolate)
     else
-        run_static_ranges(f, n, p)
+        run_static_ranges(f, n, p, isolate)
     end
     return nothing
 end
 
-@noinline function run_static_ranges(f::F, n::Int, p::Int) where {F}
+@noinline function run_static_ranges(f::F, n::Int, p::Int, isolate::Bool) where {F}
     pool = in_threaded_region() ? nothing : acquire_pool()
     if pool === nothing
         f(1, n)
@@ -551,13 +564,13 @@ end
     reset_ranges!(st)
     q, r = divrem(n, p)
     prepare_job_closure(StaticRanges{F})
-    job = StaticRanges(f, q, r, p, skip, range_deadline(p), st, pool)
+    job = StaticRanges(f, q, r, p, skip, range_deadline(p), isolate, st, pool)
     # `dispatch!`'s exception handler releases the pool
     dispatch!(pool, job, 1 <= skip <= p ? p : p + 1, true, skip)
     return nothing
 end
 
-@noinline function run_steal_ranges(f::F, n::Int, p::Int, grain::Int) where {F}
+@noinline function run_steal_ranges(f::F, n::Int, p::Int, grain::Int, isolate::Bool) where {F}
     pool = in_threaded_region() ? nothing : acquire_pool()
     if pool === nothing
         f(1, n)
@@ -569,7 +582,7 @@ end
     q, r = divrem(n, p)
     init_blocks!(st.blocks, q, r, p)
     prepare_job_closure(StealRanges{F})
-    job = StealRanges(f, st.blocks, q, r, p, skip, grain, range_deadline(p), st, pool)
+    job = StealRanges(f, st.blocks, q, r, p, skip, grain, range_deadline(p), isolate, st, pool)
     dispatch!(pool, job, 1 <= skip <= p ? p : p + 1, true, skip)
     return nothing
 end
