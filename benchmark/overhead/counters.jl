@@ -1,12 +1,16 @@
 # Hardware counters per loop on the calling thread (and summed over all threads) for a loop
-# with 64 trivial iterations: the team vs Polyester.jl's `@batch` (if installed) vs a serial
-# loop. Linux only (LinuxPerf.jl); `perf_event_paranoid` must allow user-space counting.
+# with 64 trivial iterations: the team vs Polyester.jl's `@batch` (if installed) vs
+# `Threads.@threads :dynamic` vs a serial loop. Linux only (LinuxPerf.jl);
+# `perf_event_paranoid` must allow user-space counting (at most 2). `COUNTERS_EVENTS`
+# replaces the default event groups, in LinuxPerf's syntax (the generic event names of
+# `perf list`); events that the CPU does not count are left out with a warning.
 #
 #     taskset -c 8-15 julia -t 8 --project=benchmark/overhead benchmark/overhead/counters.jl
 using ThreadTeams
 using LinuxPerf
 using Printf
 include("../aligned.jl")
+include("../record.jl")
 
 const HAVE_POLYESTER = Base.find_package("Polyester") !== nothing
 HAVE_POLYESTER && @eval using Polyester
@@ -16,6 +20,10 @@ const TEAM = TeamScheduler()
 
 f_team(x) = tforeach(i -> (@inbounds x[i] += 1.0), eachindex(x); scheduler = TEAM)
 f_team_reduce(x) = tmapreduce(i -> (@inbounds x[i]), +, eachindex(x); scheduler = TEAM)
+f_greedy(x) = tforeach(i -> (@inbounds x[i] += 1.0), eachindex(x); scheduler = GreedyTeamScheduler())
+f_dynamic(x) = Threads.@threads :dynamic for i in eachindex(x)
+    @inbounds x[i] += 1.0
+end
 f_serial(x) = for i in eachindex(x)
     @inbounds x[i] += 1.0
 end
@@ -30,13 +38,21 @@ function loops(f, x, n)
     return
 end
 
-const EVENTS = "(cpu-cycles, instructions, branch-instructions, branch-misses), " *
-    "(cache-references, cache-misses), (L1-dcache-loads, L1-dcache-load-misses)"
+const EVENTS = get(
+    ENV, "COUNTERS_EVENTS",
+    "(cpu-cycles, instructions, branch-instructions, branch-misses), " *
+        "(cache-references, cache-misses), (L1-dcache-loads, L1-dcache-load-misses), " *
+        "(task-clock, context-switches, cpu-migrations)"
+)
+# One measurement per group: with all groups open at once, some kernels and CPUs return 0
+# for events that they report as counted the whole time (cycles and cache misses on a
+# Broadwell Xeon with the NMI watchdog on), instead of multiplexing them
+const GROUPS = [m.match for m in eachmatch(r"\([^()]*\)|[^\s,()][^,()]*", EVENTS)]
+# Number of loops measured, relative to the defaults below
+const SCALE = parse(Float64, get(ENV, "COUNTERS_SCALE", "1"))
 
 # Per-event totals over the measured threads, scaled for multiplexing
-function totals(stats)
-    order = String[]
-    acc = Dict{String, Float64}()
+function totals!(order, acc, stats)
     for t in stats.threads, g in t.groups, c in g
         c.enabled > 0 || continue
         name = string(c.event)
@@ -48,16 +64,24 @@ end
 
 function report(name, f, x, n; threads)
     loops(f, x, 1000)
-    stats = @pstats EVENTS threads = threads loops(f, x, n)
-    order, acc = totals(stats)
+    n = max(round(Int, SCALE * n), 1)
+    order = String[]
+    acc = Dict{String, Float64}()
+    for group in GROUPS
+        stats = @pstats group threads = threads loops(f, x, n)
+        totals!(order, acc, stats)
+    end
     @printf("%-14s %s ", name, threads ? "all threads:   " : "calling thread:")
     for ev in order
         short = replace(
-            ev, "hw:" => "", "cache:L1_data:read:" => "L1d_", "cpu-cycles" => "cycles",
-            "instructions" => "instr", "branch_mispredicts" => "br_miss",
-            "cache_access" => "LLC_acc", "cache_misses" => "LLC_miss"
+            ev, "hw:" => "", "sw:" => "", "cache:L1_data:read:" => "L1d_",
+            "cpu-cycles" => "cycles", "instructions" => "instr",
+            "branch_mispredicts" => "br_miss", "cache_access" => "LLC_acc",
+            "cache_misses" => "LLC_miss"
         )
+        # `task_clock` is in ns; the others are counts
         @printf("%s %7.0f  ", short, acc[ev] / n)
+        record("counters", name, (threads ? "all:" : "caller:") * short, acc[ev] / n)
     end
     return println()
 end
@@ -69,9 +93,10 @@ println(
 )
 fs = Any[
     ("team", f_team, 200_000), ("team reduce", f_team_reduce, 200_000),
+    ("greedy team", f_greedy, 100_000), ("@threads :dyn", f_dynamic, 20_000),
     ("serial", f_serial, 2_000_000),
 ]
-HAVE_POLYESTER && insert!(fs, 3, ("Polyester", f_batch, 200_000))
+HAVE_POLYESTER && insert!(fs, 4, ("Polyester", f_batch, 200_000))
 for (name, f, n) in fs
     report(name, f, x, n; threads = false)
     report(name, f, x, n; threads = true)

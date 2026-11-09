@@ -12,19 +12,30 @@
 # version. (`benchmark/benchmarks.jl` is the AirspeedVelocity suite for comparing revisions,
 # in its own environment.)
 #
-# Polyester is not a dependency; to include it, run in an environment that has it.
+# Polyester is not a dependency; to include it, run in an environment that has it, such as
+# `benchmark/sweep` (whose `run.sh` runs this script for a range of thread counts).
 using ThreadTeams
 using BenchmarkTools
 using Printf
 using OhMyThreads: OhMyThreads   # ThreadTeams re-exports its API
-using KernelAbstractions: KernelAbstractions, CPU
 using FixedSizeArrays: FixedSizeArray
 include("../aligned.jl")
+include("../record.jl")   # rows for `benchmark/sweep/run.sh`, if `BENCH_CSV` is set
+
+# KernelAbstractions' `CPU` backend needs POCL, which is not built for every platform
+const HAVE_KA = try
+    @eval using KernelAbstractions: KernelAbstractions, CPU
+    true
+catch err
+    @warn "KernelAbstractions does not load, leaving out `foreach_index`" exception = err
+    false
+end
 
 const HAVE_POLYESTER = Base.find_package("Polyester") !== nothing
 HAVE_POLYESTER && @eval using Polyester
 
 const N = parse(Int, get(ENV, "OVERHEAD_N", "64"))
+const SECONDS = parse(Float64, get(ENV, "OVERHEAD_SECONDS", "5"))   # per mechanism
 
 const TEAM = TeamScheduler()
 f_tforeach_team(x) = tforeach(i -> (@inbounds x[i] += 1.0), eachindex(x); scheduler = TEAM)
@@ -50,7 +61,7 @@ f_tforeach(x) = OhMyThreads.tforeach(i -> (@inbounds x[i] += 1.0), eachindex(x))
 f_tforeach_static(x) =
     OhMyThreads.tforeach(i -> (@inbounds x[i] += 1.0), eachindex(x); scheduler = :static)
 f_tmapreduce(x) = OhMyThreads.tmapreduce(i -> (@inbounds x[i]), +, eachindex(x))
-function f_foreach_index(x)
+HAVE_KA && @eval function f_foreach_index(x)
     KernelAbstractions.foreach_index(i -> (@inbounds x[i] += 1.0), x)
     return KernelAbstractions.synchronize(CPU())
 end
@@ -73,9 +84,9 @@ fs = Any[
     ("@tasks :team", f_tasks_team), ("tforeach :greedyteam", f_greedy),
     ("@threads :static", f_static), ("@threads :dynamic", f_dynamic),
     ("OMT tforeach", f_tforeach), ("OMT tforeach :static", f_tforeach_static),
-    ("OMT tmapreduce", f_tmapreduce), ("KA foreach_index", f_foreach_index),
-    ("serial loop", f_serial),
+    ("OMT tmapreduce", f_tmapreduce), ("serial loop", f_serial),
 ]
+HAVE_KA && insert!(fs, length(fs), ("KA foreach_index", f_foreach_index))
 HAVE_POLYESTER && insert!(fs, 5, ("Polyester @batch", f_batch))
 
 # The same loops over a `FixedSizeVector` (FixedSizeArrays.jl): its length is a compile-time
@@ -98,9 +109,12 @@ println(
 )
 for (fns, arr) in ((fs, x), (fs_fixed, xf)), (name, f) in fns
     f(arr)
-    b = @benchmark $f($arr) samples = 20000 evals = 1 seconds = 5
+    b = @benchmark $f($arr) samples = 20000 evals = 1 seconds = SECONDS
     @printf(
         "%-26s min %8.2f µs  median %8.2f µs  allocs %3d  bytes %6d\n", name,
         minimum(b).time / 1.0e3, median(b).time / 1.0e3, b.allocs, b.memory
     )
+    record("overhead", name, "min_us", minimum(b).time / 1.0e3)
+    record("overhead", name, "median_us", median(b).time / 1.0e3)
+    record("overhead", name, "allocs", b.allocs)
 end

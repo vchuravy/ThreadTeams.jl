@@ -3,3 +3,5 @@ docs/build/
 *.cov
 tla/tla2tools.jar
 tla/out/
+benchmark/sweep/results/
+benchmark/sweep/.cache/
