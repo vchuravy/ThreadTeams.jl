@@ -1,6 +1,9 @@
 # Shared definitions, evaluated in the sandbox module of every test file
+# The pool is tested through its main client, the team schedulers of OhMyThreads.jl
 using ThreadTeams: nworkers
-using OhMyThreads: OhMyThreads, WithTaskIndex
+using OhMyThreads
+using OhMyThreads: WithTaskIndex
+using OhMyThreads.Implementation: team_nchunks
 using ScopedValues: ScopedValues
 
 const NW = nworkers()

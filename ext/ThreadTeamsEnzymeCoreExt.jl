@@ -1,11 +1,12 @@
 # Enzyme rules for the parallel operations of ThreadTeams (an extension on EnzymeCore).
 #
 # Enzyme can not differentiate the team itself (atomics, long-lived tasks), so
-# `run_chunks(f, n, sched)` and `run_fold(f, op, n, sched)` (`tforeach`, `tmapreduce`,
-# `treduce`, `tmap!`, `@tasks` with a team scheduler) have rules that differentiate the
-# chunk function `f(c)` and run the derivative chunks on the team, with the same scheduler.
-# `tmap` and `tcollect` throw: their chunk results are vectors, and the reduction rule
-# needs a number (or tuple of numbers) as the result.
+# `run_chunks(f, n, sched)` and `run_fold(f, op, n, sched)` (and so OhMyThreads.jl's
+# `tforeach`, `tmapreduce`, `treduce`, `tmap!` and `@tasks` with a team scheduler) have
+# rules that differentiate the chunk function `f(c)` and run the derivative chunks on the
+# team, with the same schedule. Folds whose chunk results are not numbers (or tuples of
+# numbers) throw, e.g. OhMyThreads.jl's `tmap` and `tcollect`, whose chunk results are
+# vectors.
 #
 # - forward mode: chunk `c` runs `autodiff(Forward, ...)` of `f(c)`;
 # - reverse mode: the augmented primal runs every chunk's augmented forward pass in
@@ -20,7 +21,7 @@
 # captures nothing else) accumulate in its shadow reference.
 module ThreadTeamsEnzymeCoreExt
 
-using ThreadTeams: ThreadTeams, TeamSchedulers, run_chunks, run_fold
+using ThreadTeams: ThreadTeams, Schedule, run_chunks, run_fold
 # EnzymeCore defines the functions and types; Enzyme adds the methods when loaded
 using EnzymeCore: EnzymeCore, EnzymeRules, Annotation, Const, Active, Duplicated,
     MixedDuplicated, BatchDuplicated, BatchMixedDuplicated, Forward,
@@ -71,7 +72,7 @@ end
 # reference, in any activity
 #
 
-function forward_chunks(config::FwdConfig, r::Annotation, n::Int, sched::TeamSchedulers)
+function forward_chunks(config::FwdConfig, r::Annotation, n::Int, sched::Schedule)
     mode = forward_mode(config)
     run_chunks(n, sched) do c
         autodiff(mode, Const(call_chunk), Const, r, Const(c))
@@ -82,7 +83,7 @@ end
 
 # Augmented forward pass of the chunks; the tape is the reverse thunk and one tape per chunk
 function augmented_chunks(
-        config::RevConfig, r::Annotation, n::Int, sched::TeamSchedulers,
+        config::RevConfig, r::Annotation, n::Int, sched::Schedule,
         overwritten::Bool, width::Int = EnzymeRules.width(config)
     )
     mode = reverse_mode(config, overwritten, width)
@@ -95,7 +96,7 @@ function augmented_chunks(
     return rev, tapes
 end
 
-function reverse_chunks(r::Annotation, n::Int, sched::TeamSchedulers, rev, tapes)
+function reverse_chunks(r::Annotation, n::Int, sched::Schedule, rev, tapes)
     r isa Const && return nothing
     run_chunks(n, sched) do c
         rev(Const(call_chunk), r, Const(c), @inbounds tapes[c])
@@ -111,7 +112,7 @@ end
 function EnzymeRules.forward(
         config::FwdConfig, ::Const{typeof(run_chunks)},
         ::Type{RT}, f::Annotation, n::Const{Int},
-        sched::Const{<:TeamSchedulers}
+        sched::Const{<:Schedule}
     ) where {RT}
     forward_chunks(config, as_ref(f), n.val, sched.val)
     return nothing
@@ -120,7 +121,7 @@ end
 function EnzymeRules.augmented_primal(
         config::RevConfig, ::Const{typeof(run_chunks)},
         ::Type{RT}, f::Annotation, n::Const{Int},
-        sched::Const{<:TeamSchedulers}
+        sched::Const{<:Schedule}
     ) where {RT}
     r = as_ref(f)
     rev, tapes = augmented_chunks(config, r, n.val, sched.val, EnzymeRules.overwritten(config)[2])
@@ -130,7 +131,7 @@ end
 function EnzymeRules.reverse(
         config::RevConfig, ::Const{typeof(run_chunks)},
         ::Type{RT}, tape, f::Annotation, n::Const{Int},
-        sched::Const{<:TeamSchedulers}
+        sched::Const{<:Schedule}
     ) where {RT}
     r = rebind(f, tape[1])
     rev, tapes = tape[2], tape[3]
@@ -188,7 +189,7 @@ end
 function EnzymeRules.forward(
         config::FwdConfig, ::Const{typeof(run_fold)},
         ::Type{RT}, f::Annotation, op::Annotation,
-        n::Const{Int}, sched::Const{<:TeamSchedulers}
+        n::Const{Int}, sched::Const{<:Schedule}
     ) where {RT}
     T = partials_type(f.val)
     if T === Nothing
@@ -220,7 +221,7 @@ end
 function EnzymeRules.augmented_primal(
         config::RevConfig, ::Const{typeof(run_fold)},
         ::Type{RT}, f::Annotation, op::Annotation,
-        n::Const{Int}, sched::Const{<:TeamSchedulers}
+        n::Const{Int}, sched::Const{<:Schedule}
     ) where {RT}
     T = partials_type(f.val)
     overwritten = EnzymeRules.overwritten(config)[2]
@@ -256,7 +257,7 @@ end
 function EnzymeRules.reverse(
         config::RevConfig, ::Const{typeof(run_fold)},
         dret, tape, f::Annotation, op::Annotation, n::Const{Int},
-        sched::Const{<:TeamSchedulers}
+        sched::Const{<:Schedule}
     )
     store, buf, dbuf, rev, tapes, combine = tape
     if buf === nothing

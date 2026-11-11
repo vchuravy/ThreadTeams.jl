@@ -19,7 +19,7 @@
     end
     # `init` is used once per chunk, so it must be neutral; a non-neutral init shows up
     # once per chunk
-    n = ThreadTeams.nchunks(1:100)
+    n = team_nchunks(1:100)
     @test tmapreduce(identity, +, 1:100; scheduler = team, init = 1) == 5050 + n
     # @tasks reductions
     s = @tasks for i in 1:100

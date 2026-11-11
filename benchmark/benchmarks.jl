@@ -6,6 +6,7 @@
 # `benchmark/overhead/overhead.jl` is the script behind the numbers in the documentation.
 using BenchmarkTools
 using ThreadTeams
+using OhMyThreads   # the team schedulers
 using Enzyme
 using FastBroadcast
 using FixedSizeArrays: FixedSizeArray

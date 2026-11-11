@@ -189,7 +189,7 @@ end
             # spinning until it ends (#73); in a process of its own, as without the event
             # loop it never ends
             code = """
-            using ThreadTeams
+            using ThreadTeams, OhMyThreads
             const NW = ThreadTeams.nworkers()
             for _ in 1:200
                 gate = Base.Event()

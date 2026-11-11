@@ -3,12 +3,11 @@
 [![CI](https://github.com/vchuravy/ThreadTeams.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/vchuravy/ThreadTeams.jl/actions/workflows/CI.yml)
 [![docs dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://vchuravy.github.io/ThreadTeams.jl/dev)
 
-A team of persistent worker tasks, one per thread, that runs
-[OhMyThreads.jl](https://github.com/JuliaFolds2/OhMyThreads.jl)'s parallel functions with
-low per-loop overhead. The package re-exports the OhMyThreads.jl API (`tforeach`,
-`tmapreduce`, `tmap`, `@tasks`, ...) and adds two schedulers that run on the team,
-`TeamScheduler` (`:team`) and `GreedyTeamScheduler` (`:greedyteam`). It is plain Julia on
-top of Base tasks.
+A team of persistent worker tasks, one per thread, that runs the chunks of parallel loops
+with low per-loop overhead. It is plain Julia on top of Base tasks, and it is the pool
+behind the `TeamScheduler` (`:team`) and `GreedyTeamScheduler` (`:greedyteam`) of
+[OhMyThreads.jl](https://github.com/JuliaFolds2/OhMyThreads.jl) and the CPU back-end of
+[KernelAbstractions.jl](https://github.com/JuliaGPU/KernelAbstractions.jl).
 
 One sticky worker task runs per thread of the `:default` thread pool. A parallel loop
 splits its range into one contiguous chunk per thread, runs chunk 1 on the calling task and
@@ -26,8 +25,14 @@ The package is registered, so you can install it as usual:
 pkg> add ThreadTeams
 ```
 
-It needs Julia 1.10 or newer, OhMyThreads.jl 0.8.9 and ChunkSplitters.jl; the Enzyme rules
-load with EnzymeCore.jl.
+It needs Julia 1.10 or newer and has no dependencies besides ScopedValues.jl; the Enzyme
+rules load with EnzymeCore.jl. To run `tforeach`, `tmapreduce`, `@tasks`, ... on the team,
+install OhMyThreads.jl, which depends on this package.
+
+> **Version 2** only provides the pool. Version 1 depended on OhMyThreads.jl, re-exported
+> its API and defined the schedulers; these now live in OhMyThreads.jl. Replace
+> `using ThreadTeams` by `using OhMyThreads` (and keep `using ThreadTeams` for the pool
+> controls). `ThreadTeams.nchunks` is gone.
 
 ## When to use it
 
@@ -42,18 +47,19 @@ load with EnzymeCore.jl.
   spinning workers, nested loops run serially) at a slightly higher cost per loop (a few
   tens of nanoseconds). No LLVM-level threading runtime, no conversion of arrays to
   `PtrArray`s; exceptions propagate, and the loop body is an ordinary closure. `@batch`
-  wraps the loop body in `@inbounds`; the team (like OhMyThreads) keeps bounds checks
+  wraps the loop body in `@inbounds`; the team keeps bounds checks
   unless the body has its own `@inbounds`. Compare the two with `@inbounds` in the body.
 
 ## Usage
 
+With OhMyThreads.jl, pass one of its team schedulers:
+
 ```julia
-using ThreadTeams   # re-exports OhMyThreads.jl; start Julia with threads, e.g. `julia -t auto`
+using OhMyThreads   # start Julia with threads, e.g. `julia -t auto`
 
 x = rand(10_000)
 y = similar(x)
 
-# OhMyThreads' functions and macros, with a team scheduler
 const team = TeamScheduler()
 tforeach(eachindex(x); scheduler = team) do i
     y[i] = sqrt(x[i])
@@ -64,32 +70,39 @@ tmap(sqrt, x; scheduler = GreedyTeamScheduler(chunksize = 256))  # load balancin
     @set scheduler = team
     y[i] = 2x[i]
 end
-s, m = @tasks for i in eachindex(x)                                 # reductions
-    @set scheduler = team
-    @set reducer = (a, b) -> (a[1] + b[1], max(a[2], b[2]))
-    (x[i], x[i])
+```
+
+With this package alone, split the work yourself:
+
+```julia
+using ThreadTeams
+
+ThreadTeams.foreach_range(length(x)) do lo, hi     # one contiguous range per thread
+    for i in lo:hi
+        y[i] = sqrt(x[i])
+    end
 end
+ThreadTeams.foreach_chunk(c -> work(c), 100)       # chunks 1:100, taken as threads become free
+ThreadTeams.run_fold(c -> sum(abs2, view(x, c:8:length(x))), +, 8, ThreadTeams.GreedySchedule())
 ```
 
 ### API
 
+The package exports nothing.
+
 | | |
 |---|---|
-| `TeamScheduler(; busy)`, `scheduler = :team` | OhMyThreads scheduler: one contiguous chunk per thread, run by the team; `busy = :serial` runs loops that find the team busy serially instead of on tasks |
-| `GreedyTeamScheduler(; nchunks, chunksize, busy)`, `scheduler = :greedyteam` | more chunks than threads, taken by the caller and the workers as they become free |
-| `ThreadTeams.nworkers()` | maximum number of chunks, `Threads.nthreads(:default)` |
-| `ThreadTeams.nchunks(itr, [scheduler])` | number of chunks a loop over `itr` would use now (`1` = serial) |
-| `ThreadTeams.foreach_chunk(f, m, [p])` | call `f(c)` for `c in 1:m` on at most `p` threads, without OhMyThreads (serially when the team is busy) |
+| `ThreadTeams.foreach_chunk(f, m, [p])` | call `f(c)` for `c in 1:m` on at most `p` threads (serially when the team is busy) |
 | `ThreadTeams.foreach_range(f, n; threads, schedule, grain)` | call `f(first, last)` over `1:n` with fixed block owners; static or stealing schedule |
+| `ThreadTeams.run_chunks(f, n, [schedule])` | call `f(c)` for `c in 1:n`; on tasks or serially when the team is busy, as the schedule says |
+| `ThreadTeams.run_fold(f, op, n, [schedule])` | fold the `f(c)` with `op`, in chunk order |
+| `ThreadTeams.StaticSchedule(; busy)` | chunk `c` on worker `c` (at most `nworkers()` chunks); `busy = :serial` runs loops that find the team busy serially instead of on tasks |
+| `ThreadTeams.GreedySchedule(; busy)` | any number of chunks, taken by the caller and the workers as they become free |
+| `ThreadTeams.runs_serially(schedule)` | whether a loop started now would run serially (nested, busy, one thread) |
+| `ThreadTeams.nworkers()` | size of the team, `Threads.nthreads(:default)` |
 | `ThreadTeams.set_spin_time!(seconds)` / `spin_time()` | how long idle workers spin after a loop before they sleep (default 100 µs) |
 | `ThreadTeams.parallel_phase(f)` | run `f()` with idle workers spinning until it returns (no sleep between loops) |
 | `ThreadTeams.shutdown!()` | stop the workers; the next loop starts them again |
-
-Everything else (`tforeach`, `tmapreduce`, `treduce`, `tmap`, `tmap!`, `tcollect`, `@tasks`,
-`@set`, `@local`, `@task_index`, `@allow_boxed_captures`, `chunks`, `index_chunks`, the other
-schedulers, ...) is OhMyThreads.jl, re-exported. The team schedulers accept
-`AbstractArray`s (e.g. `eachindex(x)`, `1:n`, `CartesianIndices`, a `StepRange`, or an array
-to loop over by value) and `chunks`/`index_chunks` objects.
 
 ### Fixed placement: `foreach_range`
 

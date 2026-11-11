@@ -3,6 +3,7 @@ BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 FastBroadcast = "7034ab61-46d4-4ed7-9d0f-46aef9175898"
 FixedSizeArrays = "3821ddf9-e5b5-40d5-8e25-6813ab96b5e2"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 ThreadTeams = "100744f9-5cbb-42a9-938e-f15a20f71997"
 
 [sources]
@@ -14,3 +15,4 @@ BenchmarkTools = "1"
 Enzyme = "0.13.216"
 FastBroadcast = "1.4"
 FixedSizeArrays = "1.4"
+OhMyThreads = "0.8.10"
