@@ -43,8 +43,27 @@ jobs:
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        if: matrix.version != 'min'
         env:
           JULIA_NUM_THREADS: ${{ matrix.threads }}
+      # The tests use the schedulers from an unreleased branch of OhMyThreads, which
+      # depends on ThreadTeams 2.0. Julia 1.10 ignores the `[sources]` entry for it in
+      # test/Project.toml, and its `Pkg.test` cannot merge a test dependency that itself
+      # depends on the package under test, so run the tests in the test environment with
+      # both packages developed instead. Remove once OhMyThreads is released.
+      - uses: actions/checkout@v7
+        if: matrix.version == 'min'
+        with:
+          repository: JuliaFolds2/OhMyThreads.jl
+          ref: vc/team-schedulers
+          path: OhMyThreads.jl
+      - name: Run tests
+        if: matrix.version == 'min'
+        env:
+          JULIA_NUM_THREADS: ${{ matrix.threads }}
+        run: |
+          julia --project=test -e 'using Pkg; Pkg.develop([PackageSpec(path = "."), PackageSpec(path = "OhMyThreads.jl")])'
+          julia --color=yes --check-bounds=yes --project=test test/runtests.jl
   runic:
     name: Runic formatting
     runs-on: ubuntu-latest

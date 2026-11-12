@@ -7,6 +7,9 @@ Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
+[sources]
+OhMyThreads = {url = "https://github.com/JuliaFolds2/OhMyThreads.jl", rev = "vc/team-schedulers"}
+
 [compat]
 Aqua = "0.8"
 Enzyme = "0.13.216"

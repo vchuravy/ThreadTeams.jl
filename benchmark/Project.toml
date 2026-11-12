@@ -8,6 +8,7 @@ ThreadTeams = "100744f9-5cbb-42a9-938e-f15a20f71997"
 
 [sources]
 FastBroadcast = {url = "https://github.com/vchuravy/FastBroadcast.jl", rev = "vc/threadteams"}
+OhMyThreads = {url = "https://github.com/JuliaFolds2/OhMyThreads.jl", rev = "vc/team-schedulers"}
 ThreadTeams = {path = ".."}
 
 [compat]
