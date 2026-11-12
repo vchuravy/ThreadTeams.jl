@@ -19,9 +19,10 @@ function all_on_caller(sched)
         on_caller[] &= current_task() === ct
         i
     end
-    n = max(NW, 2)
-    ThreadTeams.run_chunks(c -> (on_caller[] &= current_task() === ct; nothing), n, sched)
-    f = ThreadTeams.run_fold(c -> (on_caller[] &= current_task() === ct; c), +, n, sched)
+    # (a static schedule takes at most one chunk per worker)
+    n = sched isa PS ? NW : max(NW, 2)
+    ThreadTeams.run_chunks(c -> (on_caller[] &= current_task() === ct; nothing), n, sched.schedule)
+    f = ThreadTeams.run_fold(c -> (on_caller[] &= current_task() === ct; c), +, n, sched.schedule)
     return on_caller[] && x == 1:100 && s == 5050 && f == sum(1:n)
 end
 
@@ -35,7 +36,7 @@ end
         @test occursin("When busy: tasks", sprint(show, MIME"text/plain"(), PS()))
         @test occursin("When busy: serial", sprint(show, MIME"text/plain"(), PS(busy = :serial)))
         @test occursin("When busy: serial", sprint(show, MIME"text/plain"(), GPS(busy = :serial)))
-        @test ThreadTeams.nchunks(1:1000, PS(busy = :serial)) == (NW == 1 ? 1 : NW)
+        @test team_nchunks(1:1000, PS(busy = :serial)) == (NW == 1 ? 1 : NW)
     end
 
     @testset "while another task holds the team" begin
@@ -50,11 +51,11 @@ end
             end
             wait(started)
             for sched in SERIAL_SCHEDS
-                @test ThreadTeams.nchunks(1:1000, sched) == 1
+                @test team_nchunks(1:1000, sched) == 1
                 @test all_on_caller(sched)
             end
             # the default still runs such loops on spawned tasks
-            @test ThreadTeams.nchunks(1:1000, team) == NW
+            @test team_nchunks(1:1000, team) == NW
             @test !all_on_caller(team)
             notify(release)
             wait(holder)

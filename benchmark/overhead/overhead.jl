@@ -16,7 +16,7 @@
 using ThreadTeams
 using BenchmarkTools
 using Printf
-using OhMyThreads: OhMyThreads   # ThreadTeams re-exports its API
+using OhMyThreads   # the team schedulers
 using KernelAbstractions: KernelAbstractions, CPU
 using FixedSizeArrays: FixedSizeArray
 include("../aligned.jl")
