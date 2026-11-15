@@ -2,7 +2,7 @@
     m = zeros(Int, 20, 30)
     inner = zeros(Int, 20)
     tforeach(1:20; scheduler = team) do j
-        inner[j] = ThreadTeams.nchunks(1:30)
+        inner[j] = team_nchunks(1:30)
         tforeach(i -> (m[j, i] = i + 100j), 1:30; scheduler = team)
     end
     @test m == [i + 100j for j in 1:20, i in 1:30]

@@ -4,6 +4,7 @@
 #
 #     taskset -c 8-15 julia -t 8 --project=benchmark/overhead benchmark/overhead/counters.jl
 using ThreadTeams
+using OhMyThreads   # the team schedulers
 using LinuxPerf
 using Printf
 include("../aligned.jl")

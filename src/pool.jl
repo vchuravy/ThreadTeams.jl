@@ -45,7 +45,7 @@
 # - Everything else (the steal, the re-notify of `wait_idle`, `sleeping = false`) is
 #   relaxed: a stale value costs a spurious notification or a chunk run by the caller.
 #
-# With the `GreedyTeamScheduler` the loop has more chunks than workers: the region runs a
+# With the `GreedySchedule` the loop has more chunks than workers: the region runs a
 # `GreedyJob` on `p` participants (the caller and `p - 1` workers), each running the chunk
 # with its own index, then claiming the chunks after `p` from a shared counter until none
 # are left.
@@ -71,13 +71,14 @@ const SCOPE_BIT = 1 << (Sys.WORD_SIZE - 2)
 @inline cmd_has_scope(cmd::Int) = (cmd & SCOPE_BIT) != 0
 
 """
-    TeamScheduler(; busy = :tasks)
+    ThreadTeams.StaticSchedule(; busy = :tasks)
 
-OhMyThreads.jl scheduler (also `scheduler = :team`) that runs a parallel operation on the
-worker pool: one contiguous chunk per thread of the `:default` pool, chunk 1 on the
-calling task and chunk `c` on worker `c`. The calling task also runs every chunk whose
-worker has not picked it up in time (asleep, or not scheduled by the OS), so a loop never
-waits for an idle worker. Lowest overhead; best for balanced iterations.
+How [`ThreadTeams.run_chunks`](@ref) and [`ThreadTeams.run_fold`](@ref) place the chunks
+`1:n` of a parallel operation on the worker pool: chunk 1 on the calling task and chunk
+`c` on worker `c`, so `n` must be at most [`ThreadTeams.nworkers()`](@ref
+ThreadTeams.nworkers). The calling task also runs every chunk whose worker has not picked
+it up in time (asleep, or not scheduled by the OS), so an operation never waits for an
+idle worker. Lowest overhead; best for balanced chunks.
 
 Only one parallel operation runs on the pool at a time. One started inside a chunk
 (nested) runs serially. One started while another task uses the pool runs on
@@ -89,74 +90,49 @@ threads that are busy already only oversubscribes them. Chunks run in the caller
 scope (`ScopedValue`s, logger) and world age. If chunks throw, the exception of the first
 failing chunk is rethrown once all started chunks have finished.
 
-The task index (`OhMyThreads.WithTaskIndex`, `@task_index`) is the chunk index; for
-`chunks`/`index_chunks` inputs the position of the chunk, as with the other schedulers.
-Task-local values (`@local`) live in the persistent worker tasks: initialized once per
-worker, reused across loops.
-
-`ntasks` is not supported: chunks are not guaranteed to run at the same time, so
-`@barrier` can not be used.
+Chunks are not guaranteed to run at the same time, nor in tasks of their own: the workers
+are persistent tasks, so task-local storage outlives an operation.
 """
-struct TeamScheduler <: Scheduler
+struct StaticSchedule
     serial_when_busy::Bool
-    function TeamScheduler(; busy::Symbol = :tasks, kwargs...)
-        isempty(kwargs) || unsupported_kwargs("TeamScheduler", kwargs)
-        return new(serial_when_busy(busy))
-    end
+    StaticSchedule(; busy::Symbol = :tasks) = new(serial_when_busy(busy))
 end
 
 """
-    GreedyTeamScheduler(; nchunks = 0, chunksize = 0, busy = :tasks)
+    ThreadTeams.GreedySchedule(; busy = :tasks)
 
-OhMyThreads.jl scheduler (also `scheduler = :greedyteam`) that runs a parallel operation
-on the worker pool with load balancing: `nchunks` contiguous chunks (default
-`4 * nworkers()`), or chunks of `chunksize` elements. The calling task and the workers
-start with one chunk each, placed as with [`TeamScheduler`](@ref), then take the others
-from a shared counter until none are left. For loops whose iterations take very
-different times. See [`TeamScheduler`](@ref) for the semantics both share.
-
-Chunks are contiguous and reductions combine the chunk results in chunk order, so the
-operator only has to be associative and the result is deterministic for a given number of
-chunks. The task index is the chunk index.
+Like [`ThreadTeams.StaticSchedule`](@ref), for any number of chunks, with load balancing:
+the calling task and the workers start with one chunk each, placed as with the static
+schedule, then take the others from a shared counter until none are left. For chunks that
+take very different times.
 """
-struct GreedyTeamScheduler <: Scheduler
-    nchunks::Int
-    chunksize::Int
+struct GreedySchedule
     serial_when_busy::Bool
-    function GreedyTeamScheduler(;
-            nchunks::Integer = 0, chunksize::Integer = 0, busy::Symbol = :tasks,
-            kwargs...
-        )
-        isempty(kwargs) || unsupported_kwargs("GreedyTeamScheduler", kwargs)
-        (nchunks >= 0 && chunksize >= 0) ||
-            throw(ArgumentError("nchunks and chunksize must be non-negative"))
-        (nchunks > 0 && chunksize > 0) &&
-            throw(ArgumentError("nchunks and chunksize are mutually exclusive"))
-        return new(nchunks, chunksize, serial_when_busy(busy))
-    end
+    GreedySchedule(; busy::Symbol = :tasks) = new(serial_when_busy(busy))
 end
 
-const TeamSchedulers = Union{TeamScheduler, GreedyTeamScheduler}
+const Schedule = Union{StaticSchedule, GreedySchedule}
+
+"""
+    ThreadTeams.runs_serially(schedule) -> Bool
+
+Whether a parallel operation started now by the calling task with `schedule` would run
+serially whatever its number of chunks: with a single thread, inside another parallel
+operation on the pool, and with `busy = :serial` while the pool is busy. Callers use it to
+skip splitting their work. (Operations also run serially during precompilation and, with
+`busy = :serial`, inside `Threads.@threads`, but that is decided later.)
+
+Only plain and relaxed loads, so it can be inlined into the caller.
+"""
+@inline function runs_serially(sched::Schedule)
+    nworkers() == 1 && return true
+    return pool_busy() && (sched.serial_when_busy || in_region())
+end
 
 function serial_when_busy(busy::Symbol)
     busy === :tasks && return false
     busy === :serial && return true
     throw(ArgumentError("busy must be :tasks or :serial, not $(repr(busy))"))
-end
-
-@noinline function unsupported_kwargs(name, kwargs)
-    ks = join(("`$k`" for k in keys(kwargs)), ", ")
-    if :ntasks in keys(kwargs)
-        throw(
-            ArgumentError(
-                "$name does not take `ntasks`: chunks run on a fixed pool " *
-                    "of workers and the calling task runs chunks that no worker " *
-                    "has picked up, so the number of tasks running at the same " *
-                    "time is not fixed (`@barrier` is not supported)"
-            )
-        )
-    end
-    throw(ArgumentError("$name does not take the keyword argument$(length(kwargs) > 1 ? "s" : "") $ks"))
 end
 
 # Padding around the atomic fields the workers and the dispatcher hammer (a worker's
@@ -174,7 +150,7 @@ const PadAfter = NTuple{PAD_AFTER, Int}
 pad_before() = ntuple(_ -> 0, Val(PAD_BEFORE))
 pad_after() = ntuple(_ -> 0, Val(PAD_AFTER))
 
-# Shared chunk counter of a `GreedyTeamScheduler` region, on its own cache line
+# Shared chunk counter of a `GreedySchedule` region, on its own cache line
 mutable struct ChunkCounter
     const _pad0::PadBefore
     @atomic next::Int
@@ -1302,7 +1278,7 @@ end
 """
     ThreadTeams.stolen_chunks() -> Int
 
-Number of chunks (with [`GreedyTeamScheduler`](@ref), participants) the calling task ran
+Number of chunks (with [`ThreadTeams.GreedySchedule`](@ref), participants) the calling task ran
 because their worker had not picked them up in time, since the pool started. A high rate
 per region means workers are often asleep or not running (an oversubscribed machine). For
 diagnosis and benchmarks.
@@ -1421,7 +1397,7 @@ end
 # With `busy = :serial`, not inside a `@threads` loop: its iterations occupy the threads,
 # and taking the pool from one of them would wake workers whose threads are running the
 # others.
-@inline function take_pool(sched::TeamSchedulers)
+@inline function take_pool(sched::Schedule)
     sched.serial_when_busy && in_threaded_region() && return nothing
     return acquire_pool()
 end
@@ -1429,7 +1405,7 @@ end
 # How a loop runs when it can not use the pool: serially when nested in a region (or
 # during precompilation, or with `busy = :serial`), on tasks when another task holds the
 # pool
-@inline function no_pool_mode(sched::TeamSchedulers)
+@inline function no_pool_mode(sched::Schedule)
     (sched.serial_when_busy || generating_output() || in_region()) && return :serial
     return :tasks
 end
@@ -1533,12 +1509,12 @@ end
 
 # Run `f(chunk)` for `chunk in 1:n` on the pool, which the caller holds; `release`: see
 # `dispatch!`
-@inline run_on_pool(pool::Pool, f::F, n::Int, ::TeamScheduler, release::Bool = false) where {F} =
+@inline run_on_pool(pool::Pool, f::F, n::Int, ::StaticSchedule, release::Bool = false) where {F} =
     dispatch!(pool, f, n, release)
 # Also with `m ≤ nworkers()`, whose participants then skip the counter: a static region
 # specialized on `F` as well would cost each loop body about 150 ms more to compile
 # (`foreach_chunk`, compiled once per type, has both)
-@inline run_on_pool(pool::Pool, f::F, m::Int, ::GreedyTeamScheduler, release::Bool = false) where {F} =
+@inline run_on_pool(pool::Pool, f::F, m::Int, ::GreedySchedule, release::Bool = false) where {F} =
     run_greedy(pool, f, m, min(m, length(pool.workers)), release)
 # The `m ≥ p` chunks on `p ≤ nworkers()` participants
 @inline function run_greedy(pool::Pool, f::F, m::Int, p::Int, release::Bool) where {F}
@@ -1550,8 +1526,8 @@ end
 end
 
 # Run `f(chunk)` for `chunk in 1:n` on spawned tasks (another task holds the pool)
-run_off_pool(f::F, n::Int, ::TeamScheduler) where {F} = run_tasks(f, n)
-function run_off_pool(f::F, m::Int, ::GreedyTeamScheduler) where {F}
+run_off_pool(f::F, n::Int, ::StaticSchedule) where {F} = run_tasks(f, n)
+function run_off_pool(f::F, m::Int, ::GreedySchedule) where {F}
     p = min(m, nworkers())
     errs = Any[nothing for _ in 1:p]
     errchunks = zeros(Int, p)
@@ -1562,14 +1538,49 @@ function run_off_pool(f::F, m::Int, ::GreedyTeamScheduler) where {F}
     return nothing
 end
 
-# Run `f(chunk)` for `chunk in 1:n`: in parallel if the pool is free, serially if nested,
-# on tasks (or serially, `busy = :serial`) if another task holds the pool. With the
-# `TeamScheduler`, `n ≤ nworkers()`.
+# A static region has one worker per chunk
+@inline function check_nchunks(n::Int, ::StaticSchedule)
+    n <= nworkers() || too_many_chunks(n)
+    return nothing
+end
+@inline check_nchunks(n::Int, ::GreedySchedule) = nothing
+@noinline too_many_chunks(n::Int) = throw(
+    ArgumentError(
+        "a StaticSchedule runs at most nworkers() = $(nworkers()) chunks, got $n " *
+            "(use a GreedySchedule for more)"
+    )
+)
+
+"""
+    ThreadTeams.run_chunks(f, n::Int, schedule = ThreadTeams.StaticSchedule())
+
+Call `f(c)` for every `c in 1:n`, each once: in parallel on the worker pool if it is
+free, serially (in order, on the calling task) if the call is nested in a parallel
+operation on the pool or made during precompilation, and on `Threads.@spawn`ed tasks (or
+serially, with `busy = :serial`) if another task holds the pool. See
+[`ThreadTeams.StaticSchedule`](@ref) (which needs `n ≤ nworkers()`) and
+[`ThreadTeams.GreedySchedule`](@ref).
+
+This is the building block for parallel loops of other packages (OhMyThreads.jl's
+`TeamScheduler` and `GreedyTeamScheduler` are built on it and on
+[`ThreadTeams.run_fold`](@ref)); `f` decides what a chunk is. The region code is compiled
+for every type of `f`. With Enzyme.jl loaded it can be differentiated.
+"""
+function run_chunks end
+
 # Not inlined: its atomics must stay out of the caller (`pool_busy`). `run_chunks` and
 # `run_fold` have Enzyme rules (ext/ThreadTeamsEnzymeCoreExt.jl): Enzyme can not
 # differentiate the team itself (atomics, long-lived tasks), so the rules differentiate
 # the chunk function and run the derivative chunks on the team.
-@noinline function run_chunks(f::F, n::Int, sched::TeamSchedulers) where {F}
+@inline run_chunks(f::F, n::Int) where {F} = run_chunks(f, n, StaticSchedule())
+@noinline function run_chunks(f::F, n::Int, sched::Schedule) where {F}
+    check_nchunks(n, sched)
+    if n <= 1 || nworkers() == 1
+        for chunk in 1:n
+            f(chunk)
+        end
+        return nothing
+    end
     pool = take_pool(sched)
     if pool === nothing
         if no_pool_mode(sched) === :tasks
@@ -1591,9 +1602,9 @@ end
 
 Call `f(c)` for every `c in 1:m`, each once, on at most `min(p, m, nworkers())` threads at
 a time, the calling task being one of them. With as many chunks as threads, chunk `c` goes
-to the `c`-th participant (as with [`TeamScheduler`](@ref)); with more, participant `c`
+to the `c`-th participant (as with [`ThreadTeams.StaticSchedule`](@ref)); with more, participant `c`
 starts with chunk `c`, then the participants take the others from a shared counter until
-none are left (as with [`GreedyTeamScheduler`](@ref)). `f` decides what a chunk is, e.g.
+none are left (as with [`ThreadTeams.GreedySchedule`](@ref)). `f` decides what a chunk is, e.g.
 the iterations `(c - 1) * n ÷ m + 1:c * n ÷ m` of a loop of `n`.
 
 Runs every chunk serially on the calling task, in order, when the team is busy (held by
@@ -1681,10 +1692,27 @@ end
     return acc
 end
 
-# `op(op(f(1), f(2)), ...)` over `1:n` with the `f(chunk)` evaluated in parallel (`n ≥ 2`),
-# combined in chunk order, so deterministic for a given `n`. Not inlined: its atomics must
-# stay out of the caller (`pool_busy`).
-@noinline function run_fold(f::F, op::Op, n::Int, sched::TeamSchedulers) where {F, Op}
+"""
+    ThreadTeams.run_fold(f, op, n::Int, schedule = ThreadTeams.StaticSchedule())
+
+`op(op(f(1), f(2)), ...)` over `1:n` (`n ≥ 1`) with the `f(c)` evaluated in parallel as
+by [`ThreadTeams.run_chunks`](@ref) and combined in chunk order on the calling task, so
+`op` only has to be associative and the result is deterministic for a given `n`.
+"""
+function run_fold end
+
+@inline run_fold(f::F, op::Op, n::Int) where {F, Op} = run_fold(f, op, n, StaticSchedule())
+# Not inlined: its atomics must stay out of the caller (`pool_busy`).
+@noinline function run_fold(f::F, op::Op, n::Int, sched::Schedule) where {F, Op}
+    n >= 1 || throw(ArgumentError("run_fold needs at least one chunk, got $n"))
+    check_nchunks(n, sched)
+    if n == 1 || nworkers() == 1
+        acc = f(1)
+        for chunk in 2:n
+            acc = op(acc, f(chunk))
+        end
+        return acc
+    end
     T = Base.promote_op(f, Int)
     T === Union{} && (T = Any)
     pool = take_pool(sched)
@@ -1761,7 +1789,7 @@ Phases may be nested and may be active in several tasks at once.
 ThreadTeams.parallel_phase() do
     for step in 1:nsteps
         serial_part!(state)       # e.g. 1 ms
-        tforeach(eachindex(u); scheduler = TeamScheduler()) do i
+        ThreadTeams.foreach_range(length(u)) do lo, hi
             ...
         end
     end

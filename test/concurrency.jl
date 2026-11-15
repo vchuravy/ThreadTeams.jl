@@ -88,7 +88,7 @@ end
         inner = zeros(Int, NW)
         same_task = fill(true, NW)
         tforeach(1:NW; scheduler = team) do i
-            inner[i] = ThreadTeams.nchunks(1:100)
+            inner[i] = team_nchunks(1:100)
             outer = current_task()
             tforeach(1:100; scheduler = team) do j
                 same_task[i] &= current_task() === outer

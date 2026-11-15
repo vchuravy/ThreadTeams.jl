@@ -1,15 +1,20 @@
 # API
 
-Everything that OhMyThreads.jl exports (`tforeach`, `tmapreduce`, `treduce`, `tmap`,
-`tmap!`, `tcollect`, `@tasks`, `@set`, `@local`, `@task_index`, `@allow_boxed_captures`,
-`chunks`, `index_chunks`, the other schedulers, ...) is re-exported; see the
+The package exports nothing. The schedulers that run OhMyThreads.jl's `tforeach`,
+`tmapreduce`, `tmap`, `@tasks`, ... on the team, `TeamScheduler` and
+`GreedyTeamScheduler`, are part of OhMyThreads.jl; see the
 [OhMyThreads.jl documentation](https://juliafolds2.github.io/OhMyThreads.jl/stable/).
 
-## Schedulers
+## Parallel loops
 
 ```@docs
-TeamScheduler
-GreedyTeamScheduler
+ThreadTeams.foreach_chunk
+ThreadTeams.foreach_range
+ThreadTeams.run_chunks
+ThreadTeams.run_fold
+ThreadTeams.StaticSchedule
+ThreadTeams.GreedySchedule
+ThreadTeams.runs_serially
 ```
 
 ## The team
@@ -17,9 +22,6 @@ GreedyTeamScheduler
 ```@docs
 ThreadTeams
 ThreadTeams.nworkers
-ThreadTeams.nchunks
-ThreadTeams.foreach_chunk
-ThreadTeams.foreach_range
 ThreadTeams.set_spin_time!
 ThreadTeams.spin_time
 ThreadTeams.parallel_phase

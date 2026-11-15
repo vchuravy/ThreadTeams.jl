@@ -3,9 +3,10 @@
 # world age it was created in. Parallel loops run serially during precompilation, so no
 # closure is created then; the precompile workload only specializes the per-type cache
 # (`job_closure_cache`), which must come out of the image empty. Checked in fresh
-# processes, since the test process has run loops already: one that loads ThreadTeams
-# from its image, and one that precompiles and loads a package whose own precompile
-# workload runs loops on the team.
+# processes, since the test process has run loops already: one that loads OhMyThreads
+# (whose precompile workload runs loops with the team schedulers) from its image, and one
+# that precompiles and loads a package whose own precompile workload runs loops on the
+# team.
 
 # Run `code` in a fresh process with the threads of this one and the test environment,
 # and collect the `key=value` lines it prints
@@ -49,13 +50,13 @@ worlds_ok(jobs, w) = all(job isa ThreadTeams.JobClosure && job.world == w for jo
 """
 
 @testset "precompilation" begin
-    # Loaded from its image, ThreadTeams has caches for the loop bodies of its precompile
+    # Loaded from its image, OhMyThreads has caches for the loop bodies of its precompile
     # workload (`run_fold`, `dispatch!` and the cache are specialized for them), all empty.
     # The first loop of a session creates the closure, in the session's world age, and
     # the next loop with the same body type reuses it. (Both loops run in one function:
     # on Julia ≥ 1.12 a top-level assignment that creates a global is a new world age.)
     code = REPORT * """
-        using ThreadTeams
+        using ThreadTeams, OhMyThreads
         Fs = cached_types()
         println("caches=", length(Fs))
         println("closures_before=", closures(Fs))
@@ -106,8 +107,9 @@ worlds_ok(jobs, w) = all(job isa ThreadTeams.JobClosure && job.world == w for jo
             joinpath(pkg, "src", "TTPrecompileTest.jl"), """
             module TTPrecompileTest
             using ThreadTeams
-            fill_index!(x) = tforeach(i -> (x[i] = Float64(i)), eachindex(x); scheduler = TeamScheduler())
-            sum_squares(x) = tmapreduce(abs2, +, x; scheduler = TeamScheduler())
+            const greedy = ThreadTeams.GreedySchedule()
+            fill_index!(x) = ThreadTeams.run_chunks(i -> (x[i] = Float64(i); nothing), length(x), greedy)
+            sum_squares(x) = ThreadTeams.run_fold(i -> abs2(x[i]), +, length(x), greedy)
             # Precompile workload (loops run serially during precompilation)
             let x = zeros(8)
                 fill_index!(x)
@@ -143,7 +145,7 @@ worlds_ok(jobs, w) = all(job isa ThreadTeams.JobClosure && job.world == w for jo
         v = run_fresh(code; env)
         cache = joinpath(depot, "compiled", "v$(VERSION.major).$(VERSION.minor)", "TTPrecompileTest")
         @test isdir(cache) && !isempty(readdir(cache))
-        @test parse(Int, v["caches"]) >= 2   # the workload's `tforeach` and `tmapreduce`
+        @test parse(Int, v["caches"]) >= 2   # the workload's `run_chunks` and `run_fold`
         @test v["closures_before"] == "0"
         @test v["result_ok"] == "true"
         @test v["closures_after"] == (NW > 1 ? "2" : "0")

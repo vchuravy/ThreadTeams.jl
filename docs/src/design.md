@@ -1,6 +1,11 @@
 # Design
 
 How a parallel operation runs on the team, and what that means for the code inside it.
+The description is in terms of OhMyThreads.jl's `TeamScheduler` and `GreedyTeamScheduler`,
+which chunk the input and run the chunks with [`ThreadTeams.run_chunks`](@ref) and
+[`ThreadTeams.run_fold`](@ref) on a [`ThreadTeams.StaticSchedule`](@ref) and a
+[`ThreadTeams.GreedySchedule`](@ref); what is said about chunks holds for these functions
+as well.
 
 - **Chunking.** `TeamScheduler` splits `itr` into `min(nthreads(:default), length(itr))`
   contiguous chunks of nearly equal length (with ChunkSplitters.jl, as OhMyThreads does).

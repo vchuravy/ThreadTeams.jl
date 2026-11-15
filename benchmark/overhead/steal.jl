@@ -12,6 +12,7 @@
 # (a few milliseconds), waiting for it costs one region a lot, while stealing its chunk
 # costs many regions a little, so the median alone favours waiting.
 using ThreadTeams
+using OhMyThreads   # the team schedulers
 using Printf
 using Statistics
 

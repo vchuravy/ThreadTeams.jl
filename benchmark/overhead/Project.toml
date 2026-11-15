@@ -14,4 +14,4 @@ ThreadTeams = {path = "../.."}
 FixedSizeArrays = "1.4"
 KernelAbstractions = "0.10"
 LinuxPerf = "0.4"
-OhMyThreads = "0.8"
+OhMyThreads = "0.8.10"

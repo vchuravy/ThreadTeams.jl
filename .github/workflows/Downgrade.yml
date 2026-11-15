@@ -27,6 +27,16 @@ jobs:
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-downgrade-compat@v2
       - uses: julia-actions/julia-buildpkg@v1
-      - uses: julia-actions/julia-runtest@v1
+      # Julia 1.10 cannot use the unreleased branch of OhMyThreads through `Pkg.test`, see
+      # CI.yml. Remove once OhMyThreads is released.
+      - uses: actions/checkout@v7
+        with:
+          repository: JuliaFolds2/OhMyThreads.jl
+          ref: vc/team-schedulers
+          path: OhMyThreads.jl
+      - name: Run tests
         env:
           JULIA_NUM_THREADS: '4'
+        run: |
+          julia --project=test -e 'using Pkg; Pkg.develop([PackageSpec(path = "."), PackageSpec(path = "OhMyThreads.jl")])'
+          julia --color=yes --check-bounds=yes --project=test test/runtests.jl

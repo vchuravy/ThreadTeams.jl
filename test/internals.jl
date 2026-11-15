@@ -81,10 +81,10 @@ end
 # `run_chunks` calls the chunk function with the chunk index
 function slot_loops(n)
     x = zeros(n)
-    ThreadTeams.run_chunks(BigJob(x, ntuple(_ -> 1.0, 40)), n, team)
-    ThreadTeams.run_chunks(MutableJob(x), n, team)
-    ThreadTeams.run_chunks(UnionJob(x, 0.5, Int8(2)), n, team)
-    ThreadTeams.run_chunks(UnionJob(x, nothing, Int8(-1)), n, team)
+    ThreadTeams.run_chunks(BigJob(x, ntuple(_ -> 1.0, 40)), n, team.schedule)
+    ThreadTeams.run_chunks(MutableJob(x), n, team.schedule)
+    ThreadTeams.run_chunks(UnionJob(x, 0.5, Int8(2)), n, team.schedule)
+    ThreadTeams.run_chunks(UnionJob(x, nothing, Int8(-1)), n, team.schedule)
     return x
 end
 
@@ -169,12 +169,12 @@ end
     with_slot_mode(mode) do
         if NW > 1
             x = zeros(NW)
-            @test_throws ArgumentError ThreadTeams.run_chunks(ThrowingJob(x), NW, team)
+            @test_throws ArgumentError ThreadTeams.run_chunks(ThrowingJob(x), NW, team.schedule)
             @test !isassigned(ThreadTeams.job_slot(ThrowingJob))
             @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
             # The next loop with the same chunk function type works
             y = zeros(NW + 1)
-            ThreadTeams.run_chunks(ThrowingJob(y), NW, team)
+            ThreadTeams.run_chunks(ThrowingJob(y), NW, team.schedule)
             @test all(==(1.0), y[1:NW])
             @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
         end
